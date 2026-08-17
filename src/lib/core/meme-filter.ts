@@ -11,7 +11,7 @@
  *      rug tokens.
  */
 
-import { getToken, listActiveMints, upsertTokens } from '@/lib/db/repositories';
+import { getToken, listActiveMints, listTokens, upsertTokens } from '@/lib/db/repositories';
 import * as birdeye from '@/lib/providers/birdeye';
 import * as pumpfun from '@/lib/providers/pumpfun';
 import { NON_MEME_MINTS, looksLikePumpfunMint } from '@/lib/solana/constants';
@@ -30,6 +30,9 @@ export const CORE_MEME_TOKENS: Array<{
   { mint: 'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5', symbol: 'MEW', name: 'cat in a dogs world', decimals: 5 },
   { mint: '7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU', symbol: 'SAMO', name: 'Samoyedcoin', decimals: 9 },
   { mint: 'ukHH6c7mMyiWCf1b9pnWe25TSpkDDt3H5pQZgZ74J82', symbol: 'BOME', name: 'BOOK OF MEME', decimals: 6 },
+  // NOTE: a "CATS" entry was removed here — the mint carried no price, no
+  // liquidity and zero holders on Birdeye, i.e. it was not a tradeable token.
+  // Verify a mint on Birdeye or Solscan before adding it to the core list.
   { mint: 'A8C3xuqscfmyLrte3VmTqrAq8kgMASius9AFNANwpump', symbol: 'FWOG', name: 'Fwog', decimals: 6 },
   { mint: 'HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC', symbol: 'AI16Z', name: 'ai16z', decimals: 9 },
   { mint: '6ogzHhzdrQr9Pgv6hZ2MNze7UrzBMAFyBBWUYp1Fhitx', symbol: 'RETARDIO', name: 'RETARDIO', decimals: 6 },
@@ -138,7 +141,7 @@ export async function classifyToken(mint: string): Promise<ClassificationResult>
 
   const liquidity = overview.liquidity ?? 0;
   const volume = overview.v24hUSD ?? 0;
-  const marketCap = overview.mc ?? 0;
+  const marketCap = birdeye.marketCapOf(overview) ?? 0;
 
   if (liquidity < AUTO_ADD_THRESHOLDS.minLiquidityUsd) {
     reasons.push(`liquidity $${Math.round(liquidity).toLocaleString()} below floor`);
@@ -219,7 +222,7 @@ export async function addTokenToUniverse(
     is_core: CORE_MINTS.has(mint),
     is_active: true,
     price_usd: overview?.price ?? null,
-    market_cap_usd: overview?.mc ?? pumpCoin?.usd_market_cap ?? null,
+    market_cap_usd: birdeye.marketCapOf(overview ?? null) ?? pumpCoin?.usd_market_cap ?? null,
     liquidity_usd: overview?.liquidity ?? null,
     volume_24h_usd: overview?.v24hUSD ?? null,
     price_change_24h: overview?.priceChange24hPercent ?? null,
@@ -249,27 +252,44 @@ export async function ensureCoreTokens(): Promise<number> {
   return written;
 }
 
-/** Refreshes cached market data for the tracked universe. */
+/**
+ * Refreshes cached market data for the tracked universe.
+ *
+ * Curated symbols and names are preserved for core tokens. Birdeye reports
+ * these as they appear on-chain — "$WIF", "Bonk" — and letting that overwrite
+ * the curated list makes the leaderboard inconsistent between refreshes.
+ */
 export async function refreshTokenMarketData(mints: string[]): Promise<number> {
   if (!mints.length) return 0;
 
   const updates: Partial<MemeToken>[] = [];
   const now = new Date().toISOString();
 
-  // Overviews are one call per mint, so cap the batch to stay inside the
-  // function timeout and the Birdeye rate limit.
+  // Existing rows tell us which tokens are curated and what to keep.
+  const existing = new Map(
+    (await listTokens({ activeOnly: false, limit: 500 })).map((token) => [token.mint, token])
+  );
+
   const { mapWithConcurrency } = await import('@/lib/providers/http');
-  await mapWithConcurrency(mints.slice(0, 100), 4, async (mint) => {
+
+  // Strictly serial: token_overview is one call per mint, and the Birdeye free
+  // tier allows roughly one request per second. Any concurrency here just
+  // produces 429s and leaves tokens unrefreshed.
+  await mapWithConcurrency(mints.slice(0, 100), 1, async (mint) => {
     const overview = await birdeye.getTokenOverview(mint);
     if (!overview) return;
+
+    const current = existing.get(mint);
+    const keepCurated = current?.is_core === true;
+
     updates.push({
       mint,
-      symbol: overview.symbol || mint.slice(0, 6),
-      name: overview.name ?? null,
-      decimals: overview.decimals ?? 6,
-      logo_uri: overview.logoURI ?? null,
+      symbol: keepCurated ? current.symbol : overview.symbol || current?.symbol || mint.slice(0, 6),
+      name: keepCurated ? current.name : (overview.name ?? current?.name ?? null),
+      decimals: overview.decimals ?? current?.decimals ?? 6,
+      logo_uri: overview.logoURI ?? current?.logo_uri ?? null,
       price_usd: overview.price ?? null,
-      market_cap_usd: overview.mc ?? null,
+      market_cap_usd: birdeye.marketCapOf(overview),
       liquidity_usd: overview.liquidity ?? null,
       volume_24h_usd: overview.v24hUSD ?? null,
       price_change_24h: overview.priceChange24hPercent ?? null,

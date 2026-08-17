@@ -146,7 +146,23 @@ export async function getPrices(mints: string[]): Promise<Map<string, number>> {
     }
   }
 
-  const missing = pending.filter((mint) => !result.has(mint));
+  let missing = pending.filter((mint) => !result.has(mint));
+
+  /*
+   * Ceiling on the serial fallback. Each price is its own ~1s request, so an
+   * unbounded list turns one call into a multi-minute stall that silently eats
+   * a job's entire timeout. Callers are expected to pre-filter to mints worth
+   * pricing; this is the backstop for when they don't.
+   */
+  const SERIAL_PRICE_CEILING = 40;
+  if (missing.length > SERIAL_PRICE_CEILING) {
+    console.warn(
+      `[birdeye] ${missing.length} mints need individual price lookups; ` +
+        `capping at ${SERIAL_PRICE_CEILING}. Pre-filter the mint list, or use a plan with multi_price.`
+    );
+    missing = missing.slice(0, SERIAL_PRICE_CEILING);
+  }
+
   if (missing.length) {
     // Strictly serial. The free tier's ~1 req/sec ceiling means any concurrency
     // here just converts into 429s and backoff, which is slower than queuing.
@@ -181,10 +197,24 @@ export interface BirdeyeTokenOverview {
   logoURI: string | null;
   price: number | null;
   liquidity: number | null;
-  mc: number | null;
+  /**
+   * Market cap. Birdeye renamed this from `mc` to `marketCap`; both are
+   * declared so a rename back does not silently null the column again.
+   * `fdv` is the last resort — it differs from market cap whenever supply is
+   * not fully circulating, so it is only used when nothing better is present.
+   */
+  marketCap?: number | null;
+  mc?: number | null;
+  fdv?: number | null;
   v24hUSD: number | null;
   priceChange24hPercent: number | null;
   holder: number | null;
+}
+
+/** Reads market cap across the field names Birdeye has used. */
+export function marketCapOf(overview: BirdeyeTokenOverview | null): number | null {
+  if (!overview) return null;
+  return overview.marketCap ?? overview.mc ?? overview.fdv ?? null;
 }
 
 export async function getTokenOverview(mint: string): Promise<BirdeyeTokenOverview | null> {

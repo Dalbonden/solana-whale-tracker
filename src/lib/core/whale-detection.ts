@@ -161,7 +161,26 @@ export async function collectPortfolioMetrics(address: string): Promise<{
       helius.getSolBalance(address),
     ]);
 
-    const mints = balances.map((balance) => balance.mint);
+    /*
+     * Price only mints we can meaningfully value, never the whole wallet.
+     *
+     * A whale wallet routinely holds hundreds of SPL accounts — airdrops, dust,
+     * dead rugs. On a Birdeye plan without `multi_price` each price is its own
+     * ~1/sec request, so pricing everything costs minutes per wallet and makes
+     * discovery time out. Restricting to the tracked meme universe plus the
+     * known quote/blue-chip mints keeps it to a couple of dozen lookups that
+     * cache well across wallets.
+     *
+     * The trade-off is explicit: `portfolio_value_usd` means "SOL, stables,
+     * blue chips and tracked meme tokens" — not every long-tail position. That
+     * is the figure the whale score is actually about, and it is stable rather
+     * than dominated by unpriceable junk.
+     */
+    const priceable = balances
+      .map((balance) => balance.mint)
+      .filter((mint) => memeMints.has(mint) || NON_MEME_MINTS.has(mint));
+
+    const mints = [...priceable];
     if (solBalance > 0) mints.push(NATIVE_SOL);
     const prices = await birdeye.getPrices(mints);
 
