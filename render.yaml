@@ -22,8 +22,12 @@ services:
     region: frankfurt
     branch: main
 
-    # `npm ci` needs package-lock.json, which is committed.
-    buildCommand: npm ci && npm run build
+    # `--include=dev` is required, not optional: tailwindcss, postcss,
+    # autoprefixer and typescript are devDependencies but run at BUILD time.
+    # Render builds with NODE_ENV=production, under which `npm ci` omits
+    # devDependencies entirely, and the build dies on
+    # "Cannot find module 'autoprefixer'".
+    buildCommand: npm ci --include=dev && npm run build
     startCommand: npm start
 
     # Deliberately NOT /api/health: that endpoint returns 207 when an
@@ -37,8 +41,10 @@ services:
       - key: NODE_VERSION
         value: "22"
 
-      - key: NODE_ENV
-        value: production
+      # NODE_ENV is deliberately NOT set. Next.js already forces production
+      # mode for `next build` and `next start`, so setting it here bought
+      # nothing — while causing `npm ci` to skip the devDependencies the build
+      # needs.
 
       # --- Secrets Render generates for you -------------------------------
       # Copy CRON_SECRET out of the Render dashboard afterwards — the external
