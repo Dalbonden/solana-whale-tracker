@@ -1,0 +1,319 @@
+/**
+ * Helius client — enhanced transactions, DAS asset balances, and webhooks.
+ *
+ * Helius is the only provider that returns pre-parsed token balance changes per
+ * account, which is what makes swap attribution reliable without decoding every
+ * AMM instruction layout ourselves.
+ */
+
+import { config, required } from '@/lib/config';
+import { request, requestSoft } from './http';
+
+const RPC_LABEL = 'helius-rpc';
+
+// --- Enhanced transaction shapes (subset we consume) ------------------------
+
+export interface HeliusTokenBalanceChange {
+  userAccount: string;
+  tokenAccount: string;
+  mint: string;
+  rawTokenAmount: { tokenAmount: string; decimals: number };
+}
+
+export interface HeliusAccountData {
+  account: string;
+  nativeBalanceChange: number;
+  tokenBalanceChanges: HeliusTokenBalanceChange[] | null;
+}
+
+export interface HeliusTokenTransfer {
+  fromUserAccount: string | null;
+  toUserAccount: string | null;
+  fromTokenAccount: string | null;
+  toTokenAccount: string | null;
+  tokenAmount: number;
+  mint: string;
+}
+
+export interface HeliusNativeTransfer {
+  fromUserAccount: string;
+  toUserAccount: string;
+  amount: number;
+}
+
+export interface HeliusEnhancedTransaction {
+  signature: string;
+  slot: number;
+  timestamp: number;
+  type: string;
+  source: string;
+  fee: number;
+  feePayer: string;
+  transactionError: unknown | null;
+  accountData: HeliusAccountData[];
+  tokenTransfers: HeliusTokenTransfer[];
+  nativeTransfers: HeliusNativeTransfer[];
+  instructions: Array<{
+    programId: string;
+    innerInstructions?: Array<{ programId: string }>;
+  }>;
+  events?: {
+    swap?: {
+      nativeInput?: { account: string; amount: string };
+      nativeOutput?: { account: string; amount: string };
+      tokenInputs?: Array<{
+        userAccount: string;
+        mint: string;
+        rawTokenAmount: { tokenAmount: string; decimals: number };
+      }>;
+      tokenOutputs?: Array<{
+        userAccount: string;
+        mint: string;
+        rawTokenAmount: { tokenAmount: string; decimals: number };
+      }>;
+    };
+  };
+}
+
+function apiUrl(path: string, params: Record<string, string | number | undefined> = {}): string {
+  const key = required('HELIUS_API_KEY');
+  const url = new URL(`https://api.helius.xyz${path}`);
+  url.searchParams.set('api-key', key);
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
+  }
+  return url.toString();
+}
+
+/**
+ * Parsed transaction history for an address, newest first.
+ *
+ * @param before  signature to page backwards from
+ * @param until   stop once this signature is reached (our stored sync cursor)
+ */
+export async function getEnhancedHistory(
+  address: string,
+  opts: { limit?: number; before?: string; until?: string; type?: string } = {}
+): Promise<HeliusEnhancedTransaction[]> {
+  const { limit = 100, before, until, type } = opts;
+  return request<HeliusEnhancedTransaction[]>(
+    apiUrl(`/v0/addresses/${address}/transactions`, {
+      limit: Math.min(limit, 100),
+      before,
+      until,
+      type,
+    }),
+    { label: 'helius-history', retries: 3, timeoutMs: 20_000 }
+  );
+}
+
+/**
+ * Pages backwards until `untilSignature` is found or `maxTransactions` is hit.
+ * Returns transactions newest-first.
+ */
+export async function getHistorySince(
+  address: string,
+  untilSignature: string | null,
+  maxTransactions: number
+): Promise<HeliusEnhancedTransaction[]> {
+  const collected: HeliusEnhancedTransaction[] = [];
+  let before: string | undefined;
+
+  while (collected.length < maxTransactions) {
+    const page = await getEnhancedHistory(address, {
+      limit: Math.min(100, maxTransactions - collected.length),
+      before,
+      until: untilSignature ?? undefined,
+    });
+
+    if (!page.length) break;
+    collected.push(...page);
+
+    const last = page[page.length - 1];
+    if (page.length < 100 || !last) break;
+    before = last.signature;
+
+    if (untilSignature && page.some((tx) => tx.signature === untilSignature)) break;
+  }
+
+  return untilSignature
+    ? collected.filter((tx) => tx.signature !== untilSignature)
+    : collected;
+}
+
+/** Enhanced parse for a specific batch of signatures (max 100). */
+export async function parseTransactions(
+  signatures: string[]
+): Promise<HeliusEnhancedTransaction[]> {
+  if (!signatures.length) return [];
+  return request<HeliusEnhancedTransaction[]>(apiUrl('/v0/transactions'), {
+    method: 'POST',
+    body: JSON.stringify({ transactions: signatures.slice(0, 100) }),
+    label: 'helius-parse',
+    timeoutMs: 25_000,
+  });
+}
+
+// --- RPC ---------------------------------------------------------------------
+
+interface RpcResponse<T> {
+  result?: T;
+  error?: { code: number; message: string };
+}
+
+async function rpc<T>(method: string, params: unknown[]): Promise<T> {
+  const body = JSON.stringify({ jsonrpc: '2.0', id: method, method, params });
+  const response = await request<RpcResponse<T>>(config.solana.rpcUrl, {
+    method: 'POST',
+    body,
+    label: RPC_LABEL,
+    retries: 3,
+    timeoutMs: 20_000,
+  });
+  if (response.error) {
+    throw new Error(`RPC ${method} failed: ${response.error.message}`);
+  }
+  return response.result as T;
+}
+
+export interface TokenAccountBalance {
+  mint: string;
+  amount: number;
+  decimals: number;
+}
+
+/**
+ * All SPL token balances for an owner, via `getTokenAccountsByOwner` with
+ * jsonParsed encoding. Works against any RPC provider, not just Helius.
+ */
+export async function getTokenBalances(owner: string): Promise<TokenAccountBalance[]> {
+  const result = await rpc<{
+    value: Array<{
+      account: {
+        data: {
+          parsed: {
+            info: {
+              mint: string;
+              tokenAmount: { amount: string; decimals: number; uiAmount: number | null };
+            };
+          };
+        };
+      };
+    }>;
+  }>('getTokenAccountsByOwner', [
+    owner,
+    { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
+    { encoding: 'jsonParsed', commitment: 'confirmed' },
+  ]);
+
+  const balances = new Map<string, TokenAccountBalance>();
+  for (const entry of result?.value ?? []) {
+    const info = entry.account.data.parsed.info;
+    const amount = info.tokenAmount.uiAmount ?? 0;
+    if (amount <= 0) continue;
+    // A wallet can hold the same mint across several token accounts.
+    const existing = balances.get(info.mint);
+    if (existing) existing.amount += amount;
+    else
+      balances.set(info.mint, {
+        mint: info.mint,
+        amount,
+        decimals: info.tokenAmount.decimals,
+      });
+  }
+
+  return [...balances.values()];
+}
+
+/** Native SOL balance in SOL units. */
+export async function getSolBalance(owner: string): Promise<number> {
+  const result = await rpc<{ value: number }>('getBalance', [owner, { commitment: 'confirmed' }]);
+  return (result?.value ?? 0) / 1e9;
+}
+
+/** Signature list for an address — cheap way to gauge activity without parsing. */
+export async function getSignatures(
+  address: string,
+  limit = 100
+): Promise<Array<{ signature: string; slot: number; blockTime: number | null; err: unknown }>> {
+  return rpc('getSignaturesForAddress', [address, { limit: Math.min(limit, 1000) }]);
+}
+
+/** Largest holders of a mint — the cheapest whale-candidate source there is. */
+export async function getLargestTokenAccounts(
+  mint: string
+): Promise<Array<{ address: string; uiAmount: number }>> {
+  const result = await rpc<{
+    value: Array<{ address: string; uiAmount: number | null }>;
+  }>('getTokenLargestAccounts', [mint, { commitment: 'confirmed' }]);
+
+  return (result?.value ?? [])
+    .filter((entry) => (entry.uiAmount ?? 0) > 0)
+    .map((entry) => ({ address: entry.address, uiAmount: entry.uiAmount ?? 0 }));
+}
+
+/**
+ * Resolves token *accounts* to their owner wallets. `getTokenLargestAccounts`
+ * returns token accounts, which are useless as whale identities on their own.
+ */
+export async function getTokenAccountOwners(tokenAccounts: string[]): Promise<string[]> {
+  if (!tokenAccounts.length) return [];
+  const result = await rpc<{
+    value: Array<{
+      data: { parsed: { info: { owner: string } } } | null;
+    } | null>;
+  }>('getMultipleAccounts', [tokenAccounts.slice(0, 100), { encoding: 'jsonParsed' }]);
+
+  const owners: string[] = [];
+  for (const account of result?.value ?? []) {
+    const owner = account?.data?.parsed?.info?.owner;
+    if (owner) owners.push(owner);
+  }
+  return owners;
+}
+
+// --- Webhooks ----------------------------------------------------------------
+
+export interface HeliusWebhook {
+  webhookID: string;
+  webhookURL: string;
+  accountAddresses: string[];
+  transactionTypes: string[];
+  webhookType: string;
+}
+
+export async function listWebhooks(): Promise<HeliusWebhook[]> {
+  return requestSoft<HeliusWebhook[]>(apiUrl('/v0/webhooks'), { label: 'helius-webhooks' }, []);
+}
+
+/**
+ * Creates or updates the tracker's webhook so Helius pushes whale transactions
+ * to `/api/webhooks/helius` the moment they confirm.
+ */
+export async function upsertWebhook(addresses: string[]): Promise<HeliusWebhook> {
+  const webhookURL = `${config.app.url.replace(/\/$/, '')}/api/webhooks/helius`;
+  const payload = {
+    webhookURL,
+    // Helius caps a single webhook at 100k addresses; we stay far below that.
+    accountAddresses: addresses.slice(0, 100_000),
+    transactionTypes: ['SWAP', 'TRANSFER', 'UNKNOWN'],
+    webhookType: config.app.isProd ? 'enhanced' : 'enhancedDevnet',
+    authHeader: config.auth.webhookSecret,
+  };
+
+  const existing = (await listWebhooks()).find((hook) => hook.webhookURL === webhookURL);
+
+  if (existing) {
+    return request<HeliusWebhook>(apiUrl(`/v0/webhooks/${existing.webhookID}`), {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+      label: 'helius-webhook-update',
+    });
+  }
+
+  return request<HeliusWebhook>(apiUrl('/v0/webhooks'), {
+    method: 'POST',
+    body: JSON.stringify(payload),
+    label: 'helius-webhook-create',
+  });
+}

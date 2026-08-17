@@ -1,0 +1,37 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "nextjs",
+  "crons": [
+    {
+      "path": "/api/cron/sync",
+      "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/tokens",
+      "schedule": "17 */2 * * *"
+    },
+    {
+      "path": "/api/cron/portfolios",
+      "schedule": "23 */3 * * *"
+    },
+    {
+      "path": "/api/cron/discover",
+      "schedule": "41 */6 * * *"
+    },
+    {
+      "path": "/api/cron/webhook-sync",
+      "schedule": "7 */6 * * *"
+    }
+  ],
+  "functions": {
+    "src/app/api/cron/**/route.ts": {
+      "maxDuration": 300
+    },
+    "src/app/api/webhooks/**/route.ts": {
+      "maxDuration": 60
+    },
+    "src/app/api/stream/route.ts": {
+      "maxDuration": 60
+    }
+  }
+}
