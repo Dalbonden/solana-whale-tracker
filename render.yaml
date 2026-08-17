@@ -14,7 +14,12 @@ services:
     name: solana-whale-tracker
     runtime: node
     plan: free
-    region: oregon
+    # Frankfurt, to sit next to the Supabase project in eu-north-1 (Stockholm).
+    # Co-location is not cosmetic here: persistSwaps classifies each swap with
+    # its own query, and every alert rule issues 1-2 more, all sequential. A
+    # transatlantic hop would add ~150ms to each of those round trips and push
+    # sync runs into tens of seconds of pure latency on the free instance.
+    region: frankfurt
     branch: main
 
     # `npm ci` needs package-lock.json, which is committed.
