@@ -33,6 +33,11 @@ export async function GET() {
 
     const jobs = database.ok ? await getRecentJobRuns(10).catch(() => []) : [];
 
+    // Paid-plan endpoints this key has been observed to lack. Populated lazily
+    // as calls 401, so it is only meaningful after some traffic has run.
+    const { restrictedEndpoints } = await import('@/lib/providers/birdeye');
+    const restricted = restrictedEndpoints();
+
     const degraded = !database.ok || !configured.helius || !configured.birdeye;
 
     return ok(
@@ -40,6 +45,14 @@ export async function GET() {
         status: degraded ? 'degraded' : 'ok',
         configured,
         checks: { database, birdeye },
+        birdeyePlan: {
+          restrictedEndpoints: restricted,
+          note: restricted.length
+            ? 'Free-tier key: these endpoints are unavailable and the app is using its fallbacks. ' +
+              'multi_price falls back to one call per mint, which is slower but correct; ' +
+              'wallet_token_list falls back to RPC balances plus a price lookup.'
+            : undefined,
+        },
         rpc: config.solana.rpcUrl.replace(/api-key=[^&]+/, 'api-key=***'),
         recentJobs: jobs,
         timestamp: new Date().toISOString(),

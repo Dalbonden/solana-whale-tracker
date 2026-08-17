@@ -9,7 +9,7 @@
 
 import { config } from '@/lib/config';
 import type { OhlcvCandle } from '@/types';
-import { chunk, requestSoft, request } from './http';
+import { chunk, HttpError, mapWithConcurrency, requestSoft, request } from './http';
 
 interface BirdeyeEnvelope<T> {
   success: boolean;
@@ -36,18 +36,82 @@ function url(path: string, params: Record<string, string | number | undefined> =
 // --- Price cache -------------------------------------------------------------
 
 const PRICE_TTL_MS = 60_000;
+
+/**
+ * Quote mints are cached far longer than traded tokens. Nearly every trade is
+ * priced through SOL or a stablecoin, so on a rate-limited key these few mints
+ * would otherwise consume most of the request budget — and a five-minute-old
+ * SOL price is materially accurate, whereas a five-minute-old price for a fresh
+ * meme token is not.
+ */
+const QUOTE_PRICE_TTL_MS = 300_000;
+
+const QUOTE_MINTS_FOR_TTL = new Set([
+  'So11111111111111111111111111111111111111112', // SOL
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+  '2b1kV6DkPAnxd5ixfnxCpjxmKwqjjaYmCZfHsFu24GXo', // PYUSD
+]);
+
 const priceCache = new Map<string, { value: number; at: number }>();
+
+function ttlFor(mint: string): number {
+  return QUOTE_MINTS_FOR_TTL.has(mint) ? QUOTE_PRICE_TTL_MS : PRICE_TTL_MS;
+}
 
 function readCache(mint: string): number | undefined {
   const hit = priceCache.get(mint);
-  if (hit && Date.now() - hit.at < PRICE_TTL_MS) return hit.value;
+  if (hit && Date.now() - hit.at < ttlFor(mint)) return hit.value;
   return undefined;
 }
 
 /**
- * USD prices for up to N mints. Returns a partial map — a missing mint means
+ * Endpoints this API key is not entitled to.
+ *
+ * Birdeye gates several endpoints by plan and answers 401 for them regardless
+ * of how the request is formed — retrying is pointless and, at one request per
+ * second on the free tier, actively harmful. The first 401 records the endpoint
+ * here and every later call skips straight to the fallback path.
+ */
+const planRestricted = new Set<string>();
+
+function isPlanRestricted(error: unknown): boolean {
+  return error instanceof HttpError && (error.status === 401 || error.status === 403);
+}
+
+function cachePrice(mint: string, value: number, into: Map<string, number>): void {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return;
+  into.set(mint, value);
+  priceCache.set(mint, { value, at: Date.now() });
+}
+
+/**
+ * Single-mint price — the fallback when `multi_price` is not available.
+ *
+ * Retries generously: the free tier permits roughly one request per second, so
+ * 429 is the expected response under any burst, not an error. The shared HTTP
+ * layer honours `Retry-After` and backs off exponentially between attempts.
+ */
+async function fetchSinglePrice(mint: string): Promise<number | null> {
+  const payload = await requestSoft<BirdeyeEnvelope<{ value: number } | null>>(
+    url('/defi/price', { address: mint }),
+    { headers: headers(), label: 'birdeye-price', retries: 4, backoffMs: 1_200 },
+    { success: false, data: null }
+  );
+  const value = payload?.data?.value;
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * USD prices for a set of mints. Returns a partial map — a missing mint means
  * Birdeye has no price (illiquid or brand-new), which callers treat as $0
  * rather than as an error.
+ *
+ * Prefers `multi_price` (one call per 50 mints). That endpoint requires a paid
+ * plan, so on a free key the first call 401s and everything falls back to the
+ * single-price endpoint, one call per mint. Slower, but this is the hot path
+ * for valuing every trade — without a working fallback the entire dataset
+ * prices at $0, which is worse than being slow.
  */
 export async function getPrices(mints: string[]): Promise<Map<string, number>> {
   const result = new Map<string, number>();
@@ -61,24 +125,42 @@ export async function getPrices(mints: string[]): Promise<Map<string, number>> {
   }
   if (!pending.length) return result;
 
-  // multi_price accepts a comma-separated list; keep batches small enough to
-  // stay under URL length limits.
-  for (const batch of chunk(pending, 50)) {
-    const payload = await requestSoft<
-      BirdeyeEnvelope<Record<string, { value: number } | null>>
-    >(
-      url('/defi/multi_price', { list_address: batch.join(','), include_liquidity: 'false' }),
-      { headers: headers(), label: 'birdeye-multi-price', retries: 2 },
-      { success: false, data: {} }
-    );
-
-    for (const [mint, entry] of Object.entries(payload?.data ?? {})) {
-      const value = entry?.value;
-      if (typeof value === 'number' && Number.isFinite(value)) {
-        result.set(mint, value);
-        priceCache.set(mint, { value, at: Date.now() });
+  if (!planRestricted.has('multi_price')) {
+    for (const batch of chunk(pending, 50)) {
+      try {
+        const payload = await request<BirdeyeEnvelope<Record<string, { value: number } | null>>>(
+          url('/defi/multi_price', { list_address: batch.join(','), include_liquidity: 'false' }),
+          { headers: headers(), label: 'birdeye-multi-price', retries: 2 }
+        );
+        for (const [mint, entry] of Object.entries(payload?.data ?? {})) {
+          if (entry?.value !== undefined) cachePrice(mint, entry.value, result);
+        }
+      } catch (error) {
+        if (isPlanRestricted(error)) {
+          planRestricted.add('multi_price');
+          break;
+        }
+        // Transient failure for this batch — the single-price pass below will
+        // pick up whatever is still missing.
       }
     }
+  }
+
+  const missing = pending.filter((mint) => !result.has(mint));
+  if (missing.length) {
+    // Strictly serial. The free tier's ~1 req/sec ceiling means any concurrency
+    // here just converts into 429s and backoff, which is slower than queuing.
+    // Quote mints go first: if the budget runs short, a priced quote leg still
+    // values the trade, whereas a priced meme token alone often does not.
+    const ordered = [
+      ...missing.filter((mint) => QUOTE_MINTS_FOR_TTL.has(mint)),
+      ...missing.filter((mint) => !QUOTE_MINTS_FOR_TTL.has(mint)),
+    ];
+
+    await mapWithConcurrency(ordered, 1, async (mint) => {
+      const value = await fetchSinglePrice(mint);
+      if (value !== null) cachePrice(mint, value, result);
+    });
   }
 
   return result;
@@ -173,19 +255,35 @@ export interface BirdeyeWalletItem {
 }
 
 /**
- * Priced wallet holdings in one call. Cheaper and richer than RPC + price
- * lookups, so it is preferred when a Birdeye key is present.
+ * Priced wallet holdings in one call — cheaper and richer than RPC balances
+ * plus a price lookup, so it is preferred when the plan allows it.
+ *
+ * Returns `[]` on a plan-restricted key, which `collectPortfolioMetrics` treats
+ * as "use the RPC path instead". After the first 401 the endpoint is skipped
+ * entirely rather than re-attempted once per wallet.
  */
 export async function getWalletPortfolio(wallet: string): Promise<BirdeyeWalletItem[]> {
-  if (!config.birdeye.enabled) return [];
-  const payload = await requestSoft<
-    BirdeyeEnvelope<{ wallet: string; totalUsd: number; items: BirdeyeWalletItem[] }>
-  >(
-    url('/v1/wallet/token_list', { wallet }),
-    { headers: headers(), label: 'birdeye-wallet', timeoutMs: 20_000 },
-    { success: false, data: { wallet, totalUsd: 0, items: [] } }
-  );
-  return payload?.data?.items ?? [];
+  if (!config.birdeye.enabled || planRestricted.has('wallet_token_list')) return [];
+
+  try {
+    const payload = await request<
+      BirdeyeEnvelope<{ wallet: string; totalUsd: number; items: BirdeyeWalletItem[] }>
+    >(url('/v1/wallet/token_list', { wallet }), {
+      headers: headers(),
+      label: 'birdeye-wallet',
+      timeoutMs: 20_000,
+      retries: 1,
+    });
+    return payload?.data?.items ?? [];
+  } catch (error) {
+    if (isPlanRestricted(error)) planRestricted.add('wallet_token_list');
+    return [];
+  }
+}
+
+/** Which paid-plan endpoints this key has been observed to lack. Surfaced by /api/health. */
+export function restrictedEndpoints(): string[] {
+  return [...planRestricted];
 }
 
 export interface BirdeyeTopTrader {
