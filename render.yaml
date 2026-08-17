@@ -80,3 +80,20 @@ services:
         value: "60"
       - key: DISCOVERY_CANDIDATES_PER_RUN
         value: "40"
+
+      # Detection thresholds, calibrated against a live discovery run rather
+      # than guessed: the stock values ($250k portfolio, 15% meme exposure)
+      # qualified 0 of 171 real candidates in current market conditions.
+      # These qualified 2, including one $814k dolphin. Raise them if the whale
+      # list gets noisy; the rejection reasons in the cron response show which
+      # gate each candidate failed.
+      - key: WHALE_MIN_PORTFOLIO_USD
+        value: "50000"
+      - key: WHALE_MIN_MEME_EXPOSURE
+        value: "0.05"
+      - key: WHALE_MIN_TRADE_USD
+        value: "10000"
+      - key: WHALE_MIN_TRADES_30D
+        value: "5"
+      - key: WHALE_MIN_SCORE
+        value: "35"
