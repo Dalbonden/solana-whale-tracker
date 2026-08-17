@@ -31,7 +31,26 @@ export function required(key: string): string {
 
 export const config = {
   app: {
-    url: optional('NEXT_PUBLIC_APP_URL', 'http://localhost:3000'),
+    /**
+     * Public origin of this deployment, used to register the Helius webhook.
+     *
+     * Resolved at *runtime*, in preference order, because `NEXT_PUBLIC_*` is
+     * inlined at build time — and on hosts that assign the URL when the service
+     * is created (Render, Railway), that value is not knowable during the build.
+     * `APP_URL` and the host-injected variables are plain server env vars, so
+     * they are read fresh on every call.
+     */
+    get url(): string {
+      return (
+        optional('APP_URL') ||
+        optional('RENDER_EXTERNAL_URL') ||
+        (optional('VERCEL_PROJECT_PRODUCTION_URL')
+          ? `https://${optional('VERCEL_PROJECT_PRODUCTION_URL')}`
+          : '') ||
+        optional('NEXT_PUBLIC_APP_URL') ||
+        'http://localhost:3000'
+      );
+    },
     isProd: process.env.NODE_ENV === 'production',
   },
 

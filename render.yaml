@@ -1,0 +1,77 @@
+# =============================================================================
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# In Render: New → Blueprint → connect this repo. Every setting below is applied
+# automatically; you are only prompted for the API keys marked `sync: false`.
+#
+# The free plan gives 750 instance-hours/month. A calendar month is ~730 hours,
+# so ONE always-on free service fits — but only one. A second free service will
+# exhaust the budget and both will be suspended.
+# =============================================================================
+
+services:
+  - type: web
+    name: solana-whale-tracker
+    runtime: node
+    plan: free
+    region: oregon
+    branch: main
+
+    # `npm ci` needs package-lock.json, which is committed.
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+
+    # Deliberately NOT /api/health: that endpoint returns 207 when an
+    # integration is unconfigured, and reaching the database on every probe is
+    # wasteful. /api/ping is a static 200 that only proves the server is up.
+    healthCheckPath: /api/ping
+
+    autoDeploy: true
+
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+
+      - key: NODE_ENV
+        value: production
+
+      # --- Secrets Render generates for you -------------------------------
+      # Copy CRON_SECRET out of the Render dashboard afterwards — the external
+      # cron scheduler needs it. HELIUS_WEBHOOK_SECRET never leaves the server.
+      - key: CRON_SECRET
+        generateValue: true
+      - key: HELIUS_WEBHOOK_SECRET
+        generateValue: true
+
+      # --- Prompted at deploy time (never stored in the repo) ---------------
+      - key: HELIUS_API_KEY
+        sync: false
+      - key: SOLANA_RPC_URL
+        sync: false
+      - key: BIRDEYE_API_KEY
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+      # Optional — leave blank to skip. Without it, exchange and market-maker
+      # wallets are no longer filtered out of whale discovery.
+      - key: SOLSCAN_API_KEY
+        sync: false
+
+      # APP_URL is intentionally omitted: Render injects RENDER_EXTERNAL_URL,
+      # and lib/config.ts reads it at runtime. Set APP_URL only if you attach a
+      # custom domain.
+
+      # --- Detection thresholds --------------------------------------------
+      # Tuned down from the defaults: the free instance has 512 MB RAM and a
+      # 15-minute idle spin-down, so each job run must stay small.
+      - key: SYNC_WHALES_PER_RUN
+        value: "12"
+      - key: SYNC_TX_PER_WHALE
+        value: "60"
+      - key: DISCOVERY_CANDIDATES_PER_RUN
+        value: "40"

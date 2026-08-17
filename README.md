@@ -245,7 +245,10 @@ GET /api/cron/webhook-sync
 
 ## Deployment
 
-See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the full Vercel walkthrough, including cron scheduling, Helius webhook registration and the Hobby-plan cron limitation.
+- **[RENDER.md](RENDER.md)** — Render free plan, from creating the account onward. `render.yaml` configures the service automatically; external scheduling and the spin-down trade-off are covered.
+- **[DEPLOYMENT.md](DEPLOYMENT.md)** — Vercel, including cron scheduling, Helius webhook registration and the Hobby-plan cron limitation.
+
+The app URL is resolved at runtime from `APP_URL`, `RENDER_EXTERNAL_URL`, the Vercel production URL, then `NEXT_PUBLIC_APP_URL` — so the same commit deploys to any of them without edits.
 
 ---
 

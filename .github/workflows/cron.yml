@@ -1,0 +1,118 @@
+# =============================================================================
+# External cron driver.
+#
+# Render's free plan has no built-in cron (Render Cron Jobs are a paid service),
+# so the scheduled work is triggered from here instead.
+#
+# ── Minute budget ──
+# GitHub Actions is unlimited on PUBLIC repos, but PRIVATE repos get 2,000
+# minutes/month and every run is billed as a minimum of one whole minute.
+#
+#     every 10 min → 4,320 runs/month → over budget
+#     every 15 min → 2,880 runs/month → over budget
+#     every 30 min → 1,440 runs/month → fits
+#
+# Hence: ONE job that fans out to several endpoints, on a 30-minute schedule.
+# If this repo is private, do not lower `cron` below */30.
+#
+# If you want a tighter interval than 30 minutes — which also keeps the Render
+# instance from spinning down — use cron-job.org instead. It is free, unlimited,
+# and has no minute budget. See RENDER.md § Scheduling.
+#
+# ── Setup ──
+# Repo → Settings → Secrets and variables → Actions:
+#   APP_URL      https://your-service.onrender.com
+#   CRON_SECRET  copy from Render → Environment
+# =============================================================================
+
+name: cron
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Run a single job instead of the scheduled set'
+        required: false
+        type: choice
+        options: ['', sync, tokens, portfolios, discover, webhook-sync]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A cold Render instance can take ~50s to wake; never stack two runs.
+  group: whale-tracker-cron
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Trigger jobs
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          MANUAL_JOB: ${{ inputs.job }}
+        run: |
+          set -uo pipefail
+
+          if [ -z "${APP_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then
+            echo "::error::APP_URL and CRON_SECRET repository secrets must both be set."
+            exit 1
+          fi
+
+          BASE="${APP_URL%/}"
+          FAILED=0
+
+          call() {
+            local name="$1" path="$2"
+            echo "::group::$name"
+
+            # --max-time 600 covers a cold start (~50s) plus a long discovery run.
+            local body status
+            body=$(curl -sS --max-time 600 \
+                        --retry 2 --retry-delay 15 --retry-connrefused \
+                        -w '\n%{http_code}' \
+                        -H "Authorization: Bearer $CRON_SECRET" \
+                        "$BASE$path" 2>&1) || true
+
+            status=$(printf '%s' "$body" | tail -n1)
+            printf '%s\n' "$body" | sed '$d'
+
+            case "$status" in
+              2*) echo "→ $name ok ($status)" ;;
+              *)  echo "::warning::$name returned ${status:-no response}"
+                  FAILED=1 ;;
+            esac
+            echo "::endgroup::"
+          }
+
+          # Manual single-job dispatch.
+          if [ -n "${MANUAL_JOB:-}" ]; then
+            call "$MANUAL_JOB" "/api/cron/$MANUAL_JOB"
+            exit $FAILED
+          fi
+
+          # Ingest runs on every invocation.
+          call sync /api/cron/sync
+
+          # Heavier jobs are gated on the clock so one billed minute does as
+          # much useful work as possible. $(date -u +%H) is zero-padded, so
+          # strip the leading zero to avoid octal parsing in arithmetic.
+          HOUR=$((10#$(date -u +%H)))
+          MINUTE=$((10#$(date -u +%M)))
+
+          # Only the run in the first half of the hour does hourly-plus work.
+          if [ "$MINUTE" -lt 30 ]; then
+            [ $((HOUR % 2)) -eq 0 ] && call tokens     /api/cron/tokens
+            [ $((HOUR % 3)) -eq 0 ] && call portfolios /api/cron/portfolios
+            [ $((HOUR % 6)) -eq 0 ] && call discover   /api/cron/discover
+            # Re-subscribe the webhook after discovery may have added whales.
+            [ $((HOUR % 6)) -eq 1 ] && call webhook-sync /api/cron/webhook-sync
+          fi
+
+          exit $FAILED
