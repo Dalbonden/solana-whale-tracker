@@ -320,12 +320,36 @@ export interface BirdeyeTopTrader {
   owner: string;
   tags: string[] | null;
   type: string;
-  volume: number;
   trade: number;
   tradeBuy: number;
   tradeSell: number;
+  /**
+   * CAUTION: `volume`, `volumeBuy` and `volumeSell` are denominated in TOKEN
+   * units, not USD. Only the `*Usd`/`*USD` fields are dollars. Reading `volume`
+   * as USD overstates a wallet's size by the token's price — for a sub-cent
+   * meme token that is a factor of thousands.
+   */
+  volume: number;
   volumeBuy: number;
   volumeSell: number;
+  volumeUsd?: number | null;
+  volumeBuyUSD?: number | null;
+  volumeSellUSD?: number | null;
+  /** Birdeye's own PnL attribution for this trader on this token, in USD. */
+  totalPnl?: number | null;
+  realizedPnl?: number | null;
+  unrealizedPnl?: number | null;
+}
+
+/** USD volume for a top trader, guarding against the token-unit `volume` field. */
+export function topTraderVolumeUsd(trader: BirdeyeTopTrader): number {
+  const usd = trader.volumeUsd;
+  if (typeof usd === 'number' && Number.isFinite(usd) && usd > 0) return usd;
+  const buy = trader.volumeBuyUSD ?? 0;
+  const sell = trader.volumeSellUSD ?? 0;
+  const summed = buy + sell;
+  // Never fall back to `volume` — it is token-denominated and would be wrong.
+  return Number.isFinite(summed) && summed > 0 ? summed : 0;
 }
 
 /**

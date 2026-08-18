@@ -71,7 +71,8 @@ export async function runDiscovery(
       const evaluation = await evaluateWallet(candidate.address, {
         tradeCount: candidate.tradeCount,
         volumeUsd: candidate.volumeUsd,
-        maxTradeUsd: candidate.maxTradeUsd,
+        avgTradeUsd: candidate.avgTradeUsd,
+        realizedPnlUsd: candidate.realizedPnlUsd,
         source: candidate.source,
       });
 

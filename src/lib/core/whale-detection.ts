@@ -57,11 +57,19 @@ export function tierForScore(score: number): WhaleTier {
 }
 
 export function scoreWallet(metrics: WalletMetrics): WhaleScore {
+  /*
+   * Largest observed trade, falling back to the mean for wallets we have not
+   * synced yet (max is 0 until a trade is actually parsed). Without the
+   * fallback every freshly discovered wallet would score 0 on trade size and
+   * fail the gate, so discovery could never bootstrap.
+   */
+  const effectiveTradeSize = Math.max(metrics.maxTradeSizeUsd, metrics.avgTradeSizeUsd);
+
   const components = {
     // $50k → 0, $50M → 1
     portfolio: logNorm(metrics.portfolioValueUsd, 50_000, 50_000_000),
     // $5k → 0, $5M → 1
-    tradeSize: logNorm(metrics.maxTradeSizeUsd, 5_000, 5_000_000),
+    tradeSize: logNorm(effectiveTradeSize, 5_000, 5_000_000),
     // 2 trades/30d → 0, 150 → 1
     frequency: linNorm(metrics.tradeCount30d, 2, 150),
     memeExposure: Math.min(metrics.memeExposurePct, 1),
@@ -82,7 +90,7 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
 
   const { detection } = config;
   const clearsPortfolio = metrics.portfolioValueUsd >= detection.minPortfolioUsd;
-  const clearsTradeSize = metrics.maxTradeSizeUsd >= detection.minTradeUsd;
+  const clearsTradeSize = effectiveTradeSize >= detection.minTradeUsd;
   const clearsFrequency = metrics.tradeCount30d >= detection.minTrades30d;
   const clearsExposure = metrics.memeExposurePct >= detection.minMemeExposure;
 
@@ -226,7 +234,7 @@ export async function collectPortfolioMetrics(address: string): Promise<{
  */
 export async function collectWalletMetrics(
   address: string,
-  seed?: { tradeCount?: number; volumeUsd?: number; maxTradeUsd?: number }
+  seed?: { tradeCount?: number; volumeUsd?: number; avgTradeUsd?: number; realizedPnlUsd?: number }
 ): Promise<WalletMetrics> {
   const [portfolio, stats] = await Promise.all([
     collectPortfolioMetrics(address),
@@ -241,9 +249,23 @@ export async function collectWalletMetrics(
 
   // Stored history wins; seed data fills the gap on first sight.
   const tradeCount = Math.max(stats.tradeCount, seed?.tradeCount ?? 0);
-  const seedAvg = seed?.volumeUsd && seed.tradeCount ? seed.volumeUsd / seed.tradeCount : 0;
+  const seedAvg =
+    seed?.avgTradeUsd ??
+    (seed?.volumeUsd && seed.tradeCount ? seed.volumeUsd / seed.tradeCount : 0);
   const avgTradeSizeUsd = Math.max(stats.avgUsd, seedAvg);
-  const maxTradeSizeUsd = Math.max(stats.maxUsd, seed?.maxTradeUsd ?? seedAvg);
+
+  /*
+   * `maxTradeSizeUsd` is only ever the largest trade we actually parsed and
+   * stored. It is deliberately NOT seeded from provider data: the only figure
+   * available there is volume/trade-count, which is a mean, and presenting a
+   * mean as "largest trade" is simply false — it read as a $66M trade for a
+   * wallet holding $814K.
+   *
+   * The consequence is that a freshly discovered wallet shows 0 here until its
+   * first sync. That is honest: we have not observed a trade yet. The scorer
+   * falls back to the mean so discovery still works.
+   */
+  const maxTradeSizeUsd = stats.maxUsd;
 
   return {
     address,
@@ -254,7 +276,7 @@ export async function collectWalletMetrics(
     avgTradeSizeUsd,
     maxTradeSizeUsd,
     distinctTokens30d: Math.max(stats.distinctTokens, seed?.tradeCount ? 1 : 0),
-    realizedPnlUsd: 0,
+    realizedPnlUsd: seed?.realizedPnlUsd ?? 0,
     winRate: null,
     lastActiveAt: stats.lastActiveAt,
   };
@@ -269,7 +291,13 @@ export async function collectWalletMetrics(
  */
 export async function evaluateWallet(
   address: string,
-  seed?: { tradeCount?: number; volumeUsd?: number; maxTradeUsd?: number; source?: string }
+  seed?: {
+    tradeCount?: number;
+    volumeUsd?: number;
+    avgTradeUsd?: number;
+    realizedPnlUsd?: number;
+    source?: string;
+  }
 ): Promise<{ metrics: WalletMetrics; score: WhaleScore; whale: Partial<Whale> | null; rejected?: string }> {
   if (await solscan.isInstitutionalAccount(address)) {
     const metrics = await collectWalletMetrics(address, seed);
@@ -308,6 +336,7 @@ export async function evaluateWallet(
       trade_count_30d: metrics.tradeCount30d,
       avg_trade_size_usd: Number(metrics.avgTradeSizeUsd.toFixed(2)),
       max_trade_size_usd: Number(metrics.maxTradeSizeUsd.toFixed(2)),
+      realized_pnl_usd: Number(metrics.realizedPnlUsd.toFixed(2)),
       distinct_tokens_30d: metrics.distinctTokens30d,
       score: score.score,
       tier: score.tier,
@@ -327,7 +356,15 @@ export interface Candidate {
   source: string;
   tradeCount?: number;
   volumeUsd?: number;
-  maxTradeUsd?: number;
+  /**
+   * Mean USD size of the candidate's observed trades. Explicitly NOT a maximum:
+   * it is derived by dividing reported volume by trade count, so it must never
+   * be written to `max_trade_size_usd`, which means "largest trade we actually
+   * recorded".
+   */
+  avgTradeUsd?: number;
+  /** Birdeye's realised PnL attribution, USD. */
+  realizedPnlUsd?: number;
 }
 
 /**
@@ -354,19 +391,26 @@ export async function gatherCandidates(
     // Keep the strongest observation across tokens.
     existing.tradeCount = Math.max(existing.tradeCount ?? 0, candidate.tradeCount ?? 0);
     existing.volumeUsd = Math.max(existing.volumeUsd ?? 0, candidate.volumeUsd ?? 0);
-    existing.maxTradeUsd = Math.max(existing.maxTradeUsd ?? 0, candidate.maxTradeUsd ?? 0);
+    existing.avgTradeUsd = Math.max(existing.avgTradeUsd ?? 0, candidate.avgTradeUsd ?? 0);
+    existing.realizedPnlUsd = Math.max(
+      existing.realizedPnlUsd ?? 0,
+      candidate.realizedPnlUsd ?? 0
+    );
   };
 
   await mapWithConcurrency(mints, 3, async (mint) => {
     const traders = await birdeye.getTopTraders(mint, { timeFrame: '24h', limit: perToken });
     for (const trader of traders) {
       if (!trader.owner) continue;
+      // `volumeUsd`, never `volume` — the latter is denominated in token units.
+      const volumeUsd = birdeye.topTraderVolumeUsd(trader);
       record({
         address: trader.owner,
         source: 'birdeye_top_traders',
         tradeCount: trader.trade,
-        volumeUsd: trader.volume,
-        maxTradeUsd: trader.trade > 0 ? trader.volume / trader.trade : trader.volume,
+        volumeUsd,
+        avgTradeUsd: trader.trade > 0 ? volumeUsd / trader.trade : volumeUsd,
+        realizedPnlUsd: trader.realizedPnl ?? undefined,
       });
     }
   });
