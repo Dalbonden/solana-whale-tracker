@@ -1,6 +1,7 @@
 'use client';
 
-import { AlertTriangle, Flame, Lock, ShieldCheck, Snowflake, Users } from 'lucide-react';
+import { AlertTriangle, ExternalLink, Flame, Lock, ShieldCheck, Snowflake, Users } from 'lucide-react';
+import Link from 'next/link';
 import { useEffect, useState } from 'react';
 
 import { Badge } from '@/components/ui/badge';
@@ -14,6 +15,7 @@ interface Holder {
   label: string;
   discretionary: boolean;
   kind: string;
+  isTrackedWhale: boolean;
 }
 
 interface RiskPayload {
@@ -160,16 +162,54 @@ export function TokenRiskPanel({ mint }: { mint: string }) {
           <Users className="h-3.5 w-3.5" /> Largest holders
         </p>
         <ul className="space-y-1">
-          {data.holders.slice(0, 8).map((h, i) => (
+          {data.holders.slice(0, 10).map((h, i) => (
             <li key={h.owner ?? i} className="flex items-center gap-2 text-[11px]">
-              <span className="w-4 text-muted-foreground">{i + 1}</span>
-              <span className="font-mono">{shortenAddress(h.owner, 4)}</span>
+              <span className="w-4 shrink-0 text-muted-foreground">{i + 1}</span>
+
+              {/*
+                A holder we already track links inward to their profile, where
+                their trades and portfolio are; everyone else links out to the
+                explorer, which is the only place there is anything to see.
+              */}
+              {h.owner ? (
+                h.isTrackedWhale ? (
+                  <Link
+                    href={`/whales/${h.owner}`}
+                    className="font-mono text-primary hover:underline"
+                    title="Tracked whale — open profile"
+                  >
+                    {shortenAddress(h.owner, 4)}
+                  </Link>
+                ) : (
+                  <a
+                    href={EXPLORERS.account(h.owner)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 font-mono hover:text-foreground hover:underline"
+                    title={`${h.owner} — view on Solscan`}
+                  >
+                    {shortenAddress(h.owner, 4)}
+                    <ExternalLink className="h-2.5 w-2.5 opacity-60" />
+                  </a>
+                )
+              ) : (
+                <span className="font-mono text-muted-foreground">unknown</span>
+              )}
+
+              {h.isTrackedWhale && (
+                <Badge variant="default" className="text-[9px]">
+                  tracked whale
+                </Badge>
+              )}
               {!h.discretionary && (
                 <Badge variant="outline" className="text-[9px]">
                   {h.label}
                 </Badge>
               )}
-              <span className="tabular ml-auto font-medium">{(h.pctOfSupply * 100).toFixed(2)}%</span>
+
+              <span className="tabular ml-auto shrink-0 font-medium">
+                {(h.pctOfSupply * 100).toFixed(2)}%
+              </span>
             </li>
           ))}
         </ul>

@@ -18,7 +18,7 @@
  * every healthy token look like a rug — see `lib/solana/entities.ts`.
  */
 
-import { getToken } from '@/lib/db/repositories';
+import { getKnownWhaleAddresses, getToken } from '@/lib/db/repositories';
 import * as helius from '@/lib/providers/helius';
 import * as solscan from '@/lib/providers/solscan';
 import {
@@ -36,6 +36,8 @@ export interface HolderSlice {
   label: string;
   /** Whether this holder could choose to sell into the market. */
   discretionary: boolean;
+  /** True when this holder is a wallet we already track, so it links inward. */
+  isTrackedWhale: boolean;
 }
 
 export type RiskLevel = 'low' | 'moderate' | 'elevated' | 'high' | 'critical' | 'unknown';
@@ -119,8 +121,24 @@ async function resolveHolders(mint: string, supply: number): Promise<HolderSlice
       kind: identity.kind,
       label: identity.label,
       discretionary: !isNonDiscretionaryHolder(identity.kind),
+      isTrackedWhale: false,
     };
   });
+
+  /*
+   * Cross-reference against the tracked roster. A top holder that is also a
+   * whale we follow is the most actionable row in the table — it means we
+   * already have that wallet's trade history and can see what they are doing
+   * with the position, rather than just that they hold it.
+   */
+  try {
+    const tracked = await getKnownWhaleAddresses();
+    for (const slice of slices) {
+      if (slice.owner && tracked.has(slice.owner)) slice.isTrackedWhale = true;
+    }
+  } catch {
+    // Cross-reference is a nicety; concentration stands without it.
+  }
 
   /*
    * Solscan tags catch exchange and market-maker wallets the curated list does
