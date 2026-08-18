@@ -39,10 +39,13 @@ export function AlertList({
   initial,
   live = true,
   limit = 60,
+  filterLabel,
 }: {
   initial: Alert[];
   live?: boolean;
   limit?: number;
+  /** Active type filter, so an empty result explains itself accurately. */
+  filterLabel?: string;
 }) {
   const { alerts: streamed } = useLiveFeed({ maxItems: limit, enabled: live });
 
@@ -52,12 +55,21 @@ export function AlertList({
   }, [streamed, initial, limit]);
 
   if (!rows.length) {
+    /*
+     * A filtered view with no matches is not the same problem as having no
+     * alerts at all. Telling someone to go check discovery and sync when they
+     * have simply selected a category that has not fired yet sends them
+     * debugging something that is not broken.
+     */
     return (
       <div className="flex flex-col items-center justify-center gap-1 rounded-lg border border-dashed border-border py-12 text-center">
-        <p className="text-sm font-medium">No alerts yet</p>
+        <p className="text-sm font-medium">
+          {filterLabel ? `No ${filterLabel.toLowerCase()} alerts yet` : 'No alerts yet'}
+        </p>
         <p className="max-w-md text-xs text-muted-foreground">
-          Alerts are generated as tracked whales trade. If this stays empty, check that discovery has
-          found whales and that the sync job or Helius webhook is running.
+          {filterLabel
+            ? `Other alert types may still have fired — clear the filter to see everything.`
+            : 'Alerts are generated as tracked whales trade. If this stays empty, check that discovery has found whales and that the sync job or Helius webhook is running.'}
         </p>
       </div>
     );

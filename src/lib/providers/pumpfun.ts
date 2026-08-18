@@ -96,11 +96,31 @@ export async function getCoin(mint: string): Promise<PumpfunCoin | null> {
 }
 
 /**
- * Launch time for a mint, used by snipe detection. Returns null when pump.fun
- * does not know the mint (i.e. it is not a pump.fun launch).
+ * Launch time for a mint, used by snipe detection.
+ *
+ * pump.fun is the authoritative source but is unofficial and regularly
+ * unavailable — it has answered HTTP 530 throughout testing, which silently
+ * disabled snipe detection entirely. When it cannot answer, we fall back to the
+ * mint's first observed trade from the price feed, which is a close proxy for
+ * launch and comes from an API we know works.
+ *
+ * Returns null only when neither source can date the token, in which case no
+ * snipe claim is made rather than a guessed one.
  */
 export async function getLaunchTime(mint: string): Promise<Date | null> {
   const coin = await getCoin(mint);
-  if (!coin?.created_timestamp) return null;
-  return new Date(coin.created_timestamp);
+  if (coin?.created_timestamp) return new Date(coin.created_timestamp);
+
+  const { getFirstTradeTime } = await import('./birdeye');
+  return getFirstTradeTime(mint);
+}
+
+/** True when the pump.fun API is answering. Surfaced by /api/health. */
+export async function isReachable(): Promise<boolean> {
+  const raw = await requestSoft<unknown>(
+    url('/coins', { offset: 0, limit: 1, sort: 'created_timestamp', order: 'DESC' }),
+    { label: 'pumpfun-ping', retries: 0, timeoutMs: 8_000 },
+    null
+  );
+  return Array.isArray(raw);
 }

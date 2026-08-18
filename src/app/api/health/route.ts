@@ -31,6 +31,11 @@ export async function GET() {
       })(),
     ]);
 
+    // pump.fun is unofficial and often down; snipe detection depends on dating
+    // a token's launch, so report whether that source is answering.
+    const { isReachable } = await import('@/lib/providers/pumpfun');
+    const pumpfunUp = await isReachable().catch(() => false);
+
     const jobs = database.ok ? await getRecentJobRuns(10).catch(() => []) : [];
 
     // Paid-plan endpoints this key has been observed to lack. Populated lazily
@@ -44,7 +49,16 @@ export async function GET() {
       {
         status: degraded ? 'degraded' : 'ok',
         configured,
-        checks: { database, birdeye },
+        checks: {
+          database,
+          birdeye,
+          pumpfun: {
+            ok: pumpfunUp,
+            note: pumpfunUp
+              ? undefined
+              : 'pump.fun API unreachable — snipe detection falls back to first-trade time from Birdeye OHLCV.',
+          },
+        },
         birdeyePlan: {
           restrictedEndpoints: restricted,
           note: restricted.length

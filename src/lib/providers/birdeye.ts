@@ -270,6 +270,56 @@ export async function getOhlcv(
   return payload?.data?.items ?? [];
 }
 
+/**
+ * Approximates when a token began trading, from its earliest OHLCV candle.
+ *
+ * This exists because pump.fun's public API is the only direct source of launch
+ * time and is frequently unreachable (it currently answers HTTP 530), which
+ * silently disables snipe detection. The first candle a price feed has for a
+ * mint is a close proxy for its first trade.
+ *
+ * Two passes: hourly candles over a wide window to locate the hour trading
+ * started, then minute candles around that hour for the precision snipe
+ * detection needs. Returns null when the token already traded before the
+ * window opened — i.e. it is not a recent launch, so it cannot be a snipe.
+ */
+export async function getFirstTradeTime(
+  mint: string,
+  windowDays = 14
+): Promise<Date | null> {
+  if (!config.birdeye.enabled) return null;
+
+  const now = Math.floor(Date.now() / 1000);
+  const from = now - windowDays * 86400;
+
+  const coarse = await rangeOhlcv(mint, '1H', from, now);
+  if (!coarse.length) return null;
+
+  const firstCoarse = coarse[0].unixTime;
+  // Trading was already underway when the window opened: not a recent launch.
+  if (firstCoarse <= from + 3600) return null;
+
+  const fine = await rangeOhlcv(mint, '1m', firstCoarse - 3600, firstCoarse + 3600);
+  const firstTick = fine.length ? fine[0].unixTime : firstCoarse;
+  return new Date(firstTick * 1000);
+}
+
+/** OHLCV over an explicit time range. */
+async function rangeOhlcv(
+  mint: string,
+  interval: CandleInterval,
+  timeFrom: number,
+  timeTo: number
+): Promise<OhlcvCandle[]> {
+  const payload = await requestSoft<BirdeyeEnvelope<{ items: OhlcvCandle[] }>>(
+    url('/defi/ohlcv', { address: mint, type: interval, time_from: timeFrom, time_to: timeTo }),
+    { headers: headers(), label: 'birdeye-ohlcv-range', timeoutMs: 20_000, retries: 2 },
+    { success: false, data: { items: [] } }
+  );
+  const items = payload?.data?.items ?? [];
+  return [...items].sort((a, b) => a.unixTime - b.unixTime);
+}
+
 // --- Wallet ------------------------------------------------------------------
 
 export interface BirdeyeWalletItem {

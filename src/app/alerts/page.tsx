@@ -87,7 +87,12 @@ export default async function AlertsPage({
         ))}
       </div>
 
-      <AlertList initial={filtered.rows} limit={100} live={active === 'all'} />
+      <AlertList
+        initial={filtered.rows}
+        limit={100}
+        live={active === 'all'}
+        filterLabel={active === 'all' ? undefined : FILTERS.find((f) => f.value === active)?.label}
+      />
     </div>
   );
 }
