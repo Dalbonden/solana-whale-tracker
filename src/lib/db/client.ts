@@ -25,7 +25,18 @@ export function db(): SupabaseClient {
 
   cached = createClient(config.supabase.url, config.supabase.serviceRoleKey, {
     auth: { persistSession: false, autoRefreshToken: false },
-    global: { headers: { 'x-application-name': 'solana-whale-tracker' } },
+    global: {
+      headers: { 'x-application-name': 'solana-whale-tracker' },
+      // Next patches global fetch and caches GET responses by default —
+      // including the ones supabase-js makes, since PostgREST reads are plain
+      // GETs. That cache is written to .next/cache and survives restarts, so a
+      // page could serve a database read from hours ago forever, and
+      // `export const dynamic = 'force-dynamic'` does not cover it: that
+      // governs the route's own rendering, not fetches a library issues.
+      //
+      // Every read here is live analytics. None of it is ever safe to cache.
+      fetch: (input, init) => fetch(input, { ...init, cache: 'no-store' }),
+    },
   });
 
   return cached;

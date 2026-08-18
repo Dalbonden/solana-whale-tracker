@@ -16,16 +16,24 @@ import { config } from '@/lib/config';
 import {
   deletePositionsForWhale,
   getAllTradesForWhale,
+  updateTradeClassifications,
   upsertPositions,
 } from '@/lib/db/repositories';
 import type { WhalePosition, WhaleTrade } from '@/types';
 
 import { applyTrade, stateToRow, type PositionState } from './positions';
 
+/** Money is stored to the cent; nulls stay null rather than becoming 0. */
+function round2(value: number | null): number | null {
+  return value === null ? null : Number(value.toFixed(2));
+}
+
 export interface RebuildResult {
   address: string;
   trades: number;
   positions: number;
+  /** Trades whose own P&L fields were recomputed from the replay. */
+  reclassified: number;
   open: number;
   incompleteBasis: number;
 }
@@ -46,12 +54,18 @@ export async function rebuildWhalePositions(address: string): Promise<RebuildRes
   // cannot attribute belongs in one record rather than one record per sale.
   const cycles = new Map<string, Array<{ symbol: string | null; state: PositionState }>>();
 
+  // The replay also re-derives each trade's own classification. Backfilled
+  // trades are stored with those fields blank — their flags are meaningless
+  // until the full history is ordered — so without writing them back, the P&L
+  // column stays empty even once the position ledger knows the cost basis.
+  const reclassified: Partial<WhaleTrade>[] = [];
+
   for (const trade of sortTrades(trades)) {
     const mint = trade.token_mint;
     const history = cycles.get(mint) ?? [];
     const current = history[history.length - 1];
 
-    const { state } = applyTrade(
+    const { state, classification } = applyTrade(
       current?.state ?? null,
       {
         signature: trade.signature,
@@ -62,6 +76,18 @@ export async function rebuildWhalePositions(address: string): Promise<RebuildRes
       },
       { fullExitResidual: config.alerts.fullExitResidual }
     );
+
+    reclassified.push({
+      ...trade,
+      is_new_position: classification.isNewPosition,
+      is_full_exit: classification.isFullExit,
+      cost_basis_usd: round2(classification.costBasisUsd),
+      realized_pnl_usd: round2(classification.realizedPnlUsd),
+      realized_pnl_pct:
+        classification.realizedPnlPct === null
+          ? null
+          : Number(classification.realizedPnlPct.toFixed(6)),
+    });
 
     const entry = { symbol: trade.token_symbol ?? current?.symbol ?? null, state };
 
@@ -87,11 +113,13 @@ export async function rebuildWhalePositions(address: string): Promise<RebuildRes
 
   await deletePositionsForWhale(address);
   if (rows.length) await upsertPositions(rows);
+  const reclassifiedCount = await updateTradeClassifications(reclassified);
 
   return {
     address,
     trades: trades.length,
     positions: rows.length,
+    reclassified: reclassifiedCount,
     open,
     incompleteBasis: rows.filter((row) => row.basis_complete === false).length,
   };

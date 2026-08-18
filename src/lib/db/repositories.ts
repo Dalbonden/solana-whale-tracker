@@ -164,6 +164,43 @@ export async function markWhaleSynced(
   if (error) throw new Error(`markWhaleSynced: ${error.message}`);
 }
 
+/** Advances a whale's backfill cursor after a backwards pass. */
+export async function markBackfill(
+  address: string,
+  state: { cursor: string | null; complete: boolean }
+): Promise<void> {
+  const patch: Record<string, unknown> = { backfill_complete: state.complete };
+  if (state.cursor) patch.backfill_cursor = state.cursor;
+
+  const { error } = await db().from('whales').update(patch).eq('address', address);
+  if (error) throw new Error(`markBackfill: ${error.message}`);
+}
+
+/** Oldest trade we hold for a whale — the backfill's starting point. */
+export async function getOldestTradeSignature(address: string): Promise<string | null> {
+  const { data, error } = await db()
+    .from('whale_trades')
+    .select('signature')
+    .eq('whale_address', address)
+    .order('block_time', { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error(`getOldestTradeSignature: ${error.message}`);
+  return (data?.signature as string) ?? null;
+}
+
+/** Whales still worth walking backwards, least-recently-backfilled first. */
+export async function getWhalesToBackfill(limit: number): Promise<Whale[]> {
+  const { data, error } = await db()
+    .from('whales')
+    .select('*')
+    .eq('backfill_complete', false)
+    .order('score', { ascending: false })
+    .limit(limit);
+  if (error) throw new Error(`getWhalesToBackfill: ${error.message}`);
+  return (data ?? []) as Whale[];
+}
+
 /** Every address the Helius webhook should be subscribed to. */
 export async function getTrackedAddresses(): Promise<string[]> {
   const { data, error } = await db()
@@ -240,6 +277,25 @@ export async function insertTrades(trades: Partial<WhaleTrade>[]): Promise<Whale
   }
 
   return inserted;
+}
+
+/**
+ * Writes back the position flags and P&L a replay derived for each trade.
+ *
+ * Sent as full rows keyed on `id` rather than a partial patch: PostgREST models
+ * an upsert as INSERT ... ON CONFLICT, so the payload has to satisfy the table's
+ * NOT NULL columns even though every row here already exists and will take the
+ * UPDATE branch.
+ */
+export async function updateTradeClassifications(trades: Partial<WhaleTrade>[]): Promise<number> {
+  if (!trades.length) return 0;
+  let written = 0;
+  for (const batch of chunk(trades, 200)) {
+    const { error } = await db().from('whale_trades').upsert(batch, { onConflict: 'id' });
+    if (error) throw new Error(`updateTradeClassifications: ${error.message}`);
+    written += batch.length;
+  }
+  return written;
 }
 
 /** Prior trades for a whale/token pair — the basis for position tracking. */

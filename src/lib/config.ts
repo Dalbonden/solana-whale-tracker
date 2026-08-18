@@ -133,6 +133,8 @@ export const config = {
     whalesPerSync: num('SYNC_WHALES_PER_RUN', 25),
     /** Max transactions pulled per whale per sync. */
     txPerWhale: num('SYNC_TX_PER_WHALE', 100),
+    /** How far back one backfill pass walks per whale, in transactions. */
+    backfillTxPerWhale: num('BACKFILL_TX_PER_WHALE', 300),
     /** Max candidate wallets evaluated per discovery run. */
     discoveryCandidates: num('DISCOVERY_CANDIDATES_PER_RUN', 120),
   },

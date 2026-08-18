@@ -48,6 +48,7 @@ export async function GET(request: Request) {
       processed: results.length,
       created: results.reduce((sum, r) => sum + r.positions, 0),
       tradesReplayed: results.reduce((sum, r) => sum + r.trades, 0),
+      tradesReclassified: results.reduce((sum, r) => sum + r.reclassified, 0),
       openPositions: results.reduce((sum, r) => sum + r.open, 0),
       incompleteBasis: results.reduce((sum, r) => sum + r.incompleteBasis, 0),
       errors: errors.slice(0, 10),

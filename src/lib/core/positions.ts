@@ -133,12 +133,12 @@ export function applyTrade(
   const next: PositionState =
     state === null || opening ? emptyState(trade.blockTime, trade.signature) : { ...state };
 
-  // Doubt is inherited. If the previous cycle for this token ended without a
-  // basis we could observe, the whale may still hold inventory we never saw,
-  // and any P&L on the new cycle would be measured against a partial position.
-  if (opening && state !== null && !state.basisComplete) {
-    next.basisComplete = false;
-  }
+  // Doubt is deliberately NOT inherited across cycles. If we watched this buy,
+  // we know what these units cost, and that stays true even when the same
+  // wallet earlier dumped a bag we never saw it acquire. Unseen inventory makes
+  // the position look *smaller* than it is; it does not make the basis of the
+  // units we did watch any less real, and `amount` only ever counts those.
+  // Carrying the doubt forward suppressed P&L we had genuinely earned.
 
   next.lastTradeAt = trade.blockTime;
 

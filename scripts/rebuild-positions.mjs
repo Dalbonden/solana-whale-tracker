@@ -84,6 +84,7 @@ console.log(`\nDone in ${((Date.now() - started) / 1000).toFixed(1)}s`);
 console.log(`  whales rebuilt   ${result.processed ?? 0}`);
 console.log(`  trades replayed  ${result.tradesReplayed ?? 0}`);
 console.log(`  positions written ${result.created ?? 0}`);
+console.log(`  trades repriced  ${result.tradesReclassified ?? 0}`);
 console.log(`  still open       ${result.openPositions ?? 0}`);
 console.log(`  unknown basis    ${result.incompleteBasis ?? 0}`);
 

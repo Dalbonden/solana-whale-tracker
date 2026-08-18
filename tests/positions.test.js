@@ -134,14 +134,16 @@ test('repeated unattributable sells stay in one record', () => {
   assert.equal(state.basisComplete, false);
 });
 
-test('a later buy opens a new cycle but inherits the doubt', () => {
+test('a buy after unattributable sells opens a cycle with a known basis', () => {
   const { state, classification } = replay([sell(500, 12000), buy(100, 1000, 60)]);
   assert.equal(classification.isNewPosition, true);
   assert.equal(state.status, 'open');
   assert.equal(state.amount, 100);
-  // They may still hold inventory we never saw, so P&L on this cycle would be
-  // measured against a partial position.
-  assert.equal(state.basisComplete, false);
+  // We watched them pay for these 100 units. An earlier bag we never saw them
+  // acquire makes the position look smaller than it is — it does not make this
+  // entry price unknown.
+  assert.equal(state.basisComplete, true);
+  assert.equal(state.avgEntryPrice, 10);
 });
 
 test('selling more than we saw bought marks the cycle partial', () => {
@@ -213,12 +215,11 @@ test('unrealised P&L is null without a price, never zero', () => {
 });
 
 test('unrealised P&L is null when the basis was never observed', () => {
-  const { state } = replay([sell(500, 12000), buy(100, 1000, 60)]);
+  // Sell-only cycle: nothing was ever bought, so there is nothing to mark.
+  const { state } = replay([sell(500, 12000)]);
   const view = viewOf(state, 20);
-  assert.equal(view.unrealized_pnl_usd, null, 'inherited doubt means no mark');
+  assert.equal(view.unrealized_pnl_usd, null, 'no observed basis means no mark');
   assert.equal(view.total_pnl_usd, null);
-  assert.notEqual(view.market_value_usd, null, 'value is still knowable');
-  assert.notEqual(view.conviction_pct, null, 'so is its share of the book');
 });
 
 test('conviction is the position as a share of the book', () => {

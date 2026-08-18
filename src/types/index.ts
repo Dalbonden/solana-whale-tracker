@@ -54,6 +54,10 @@ export interface Whale {
   discovery_source: string | null;
   is_tracked: boolean;
   last_signature: string | null;
+  /** Oldest signature already scanned by the backfill, walking backwards. */
+  backfill_cursor: string | null;
+  /** True once Helius has no history older than the cursor. */
+  backfill_complete: boolean;
   first_seen_at: string;
   last_active_at: string | null;
   last_synced_at: string | null;

@@ -69,6 +69,10 @@ create table if not exists public.whales (
   is_tracked           boolean       not null default true,
   -- incremental sync cursor: newest signature already ingested
   last_signature       text,
+  -- backfill cursor: oldest signature already scanned, walking backwards.
+  -- Separate from last_signature because the two run in opposite directions.
+  backfill_cursor      text,
+  backfill_complete    boolean       not null default false,
   first_seen_at        timestamptz   not null default now(),
   last_active_at       timestamptz,
   last_synced_at       timestamptz,

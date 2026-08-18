@@ -122,13 +122,21 @@ export default async function WhaleProfilePage({ params }: { params: { address: 
         ? `${unrealizedUsd >= 0 ? '+' : ''}${formatUsd(unrealizedUsd)}`
         : '—',
       tone: markable.length === 0 ? undefined : unrealizedUsd >= 0 ? 'bull' : 'bear',
+      // Three different reasons this can be blank, and they are not the same
+      // thing to a reader: no data at all, nothing currently held, or holdings
+      // whose entry we never witnessed. Saying "no known entry" for a wallet we
+      // have simply never seen trade reads as a broken feature.
       hint: markable.length
         ? `${markable.length}/${openPositions.length} open positions priced${
             markedCostBasis > 0
               ? ` · ${unrealizedUsd >= 0 ? '+' : ''}${((unrealizedUsd / markedCostBasis) * 100).toFixed(0)}%`
               : ''
           }`
-        : 'no open position has a known entry yet',
+        : positions.length === 0
+          ? 'no trades ingested for this wallet yet'
+          : openPositions.length === 0
+            ? `${positions.length} closed position${positions.length === 1 ? '' : 's'}, nothing held`
+            : 'holdings opened before tracking began',
     },
     {
       label: 'Meme exposure',

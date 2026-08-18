@@ -8,6 +8,7 @@
  */
 
 import { config } from '@/lib/config';
+import { STABLE_MINTS } from '@/lib/solana/constants';
 import type { OhlcvCandle } from '@/types';
 import { chunk, HttpError, mapWithConcurrency, requestSoft, request } from './http';
 
@@ -268,6 +269,119 @@ export async function getOhlcv(
     { success: false, data: { items: [] } }
   );
   return payload?.data?.items ?? [];
+}
+
+/** OHLCV over an explicit window, for pricing historical trades. */
+export async function getOhlcvRange(
+  mint: string,
+  interval: CandleInterval,
+  fromUnix: number,
+  toUnix: number
+): Promise<OhlcvCandle[]> {
+  if (!config.birdeye.enabled) return [];
+  const payload = await requestSoft<BirdeyeEnvelope<{ items: OhlcvCandle[] }>>(
+    url('/defi/ohlcv', {
+      address: mint,
+      type: interval,
+      time_from: Math.floor(fromUnix),
+      time_to: Math.ceil(toUnix),
+    }),
+    { headers: headers(), label: 'birdeye-ohlcv-range', timeoutMs: 25_000 },
+    { success: false, data: { items: [] } }
+  );
+  return payload?.data?.items ?? [];
+}
+
+/**
+ * Prices a set of mints *as of arbitrary past moments*.
+ *
+ * Backfilled trades must be valued at the price when they happened, not today.
+ * Using the current price would silently invent a cost basis — a wallet that
+ * bought at $0.004 and is now at $0.0008 would be recorded as having entered at
+ * today's price and shown as flat, which is worse than reporting nothing.
+ *
+ * In practice this is cheap. `valueSwapUsd` prefers the quote leg, so almost
+ * every trade is priced from SOL or a stablecoin: one well-covered OHLCV series
+ * for SOL, and a constant for stables. The meme mint itself is only consulted
+ * when a swap has no recognisable quote leg.
+ */
+export interface HistoricalPrices {
+  /** Price at a moment, or null when no candle covers it. */
+  priceAt(mint: string, unixSeconds: number): number | null;
+  /** Mints we could not build a series for, for honest reporting. */
+  missing: string[];
+}
+
+/** Candle size that keeps a window inside Birdeye's per-response item cap. */
+function intervalForSpan(seconds: number): CandleInterval {
+  const hours = seconds / 3600;
+  if (hours <= 8) return '1m';
+  if (hours <= 72) return '15m';
+  if (hours <= 24 * 45) return '1H';
+  return '4H';
+}
+
+export async function buildHistoricalPrices(
+  mints: string[],
+  fromUnix: number,
+  toUnix: number
+): Promise<HistoricalPrices> {
+  const series = new Map<string, { times: number[]; closes: number[] }>();
+  const missing: string[] = [];
+
+  // Pad the window so a trade at either edge still lands inside a candle.
+  const interval = intervalForSpan(Math.max(toUnix - fromUnix, 1));
+  const pad = 6 * 3600;
+
+  for (const mint of new Set(mints)) {
+    if (STABLE_MINTS.has(mint)) continue; // priced at 1 below
+
+    const candles = await getOhlcvRange(mint, interval, fromUnix - pad, toUnix + pad);
+    if (!candles.length) {
+      missing.push(mint);
+      continue;
+    }
+
+    const sorted = [...candles].sort((a, b) => a.unixTime - b.unixTime);
+    series.set(mint, {
+      times: sorted.map((c) => c.unixTime),
+      closes: sorted.map((c) => c.c),
+    });
+  }
+
+  return {
+    missing,
+    priceAt(mint: string, unixSeconds: number): number | null {
+      if (STABLE_MINTS.has(mint)) return 1;
+
+      const entry = series.get(mint);
+      if (!entry || !entry.times.length) return null;
+
+      // Nearest candle by time. Binary search: histories run to thousands of
+      // candles and this is called once per trade.
+      let lo = 0;
+      let hi = entry.times.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (entry.times[mid] < unixSeconds) lo = mid + 1;
+        else hi = mid;
+      }
+      const after = lo;
+      const before = Math.max(lo - 1, 0);
+      const pick =
+        Math.abs(entry.times[after] - unixSeconds) < Math.abs(entry.times[before] - unixSeconds)
+          ? after
+          : before;
+
+      // Refuse to price a trade that falls far outside the candles we have —
+      // the nearest close could be days away and meaningless.
+      const maxGapSeconds = 6 * 3600;
+      if (Math.abs(entry.times[pick] - unixSeconds) > maxGapSeconds) return null;
+
+      const close = entry.closes[pick];
+      return Number.isFinite(close) && close > 0 ? close : null;
+    },
+  };
 }
 
 /**
