@@ -21,13 +21,21 @@ export async function GET(request: Request) {
 
   const url = new URL(request.url);
   const maxCandidates = Number(url.searchParams.get('max')) || undefined;
+  /*
+   * `?includeKnown=true` re-evaluates wallets already tracked instead of
+   * skipping them. Use it to refresh provider-sourced activity figures for the
+   * existing roster — our own trade history only covers the period since
+   * tracking began, so it under-reports a whale's real 30-day activity until
+   * the wallet has been watched for a while.
+   */
+  const includeKnown = url.searchParams.get('includeKnown') === 'true';
 
   return runJob('cron.discover', async () => {
     // Cheap and idempotent; guarantees the core universe exists even if the
     // seed SQL was never run.
     await ensureCoreTokens();
 
-    const result = await runDiscovery({ maxCandidates });
+    const result = await runDiscovery({ maxCandidates, includeKnown });
 
     return {
       processed: result.evaluated,

@@ -266,4 +266,4 @@ No private keys, no wallet connection, no trade execution, no order routing. It 
 
 ## License
 
-MIT
+MIT © Feronyx HB — see [LICENSE](LICENSE).

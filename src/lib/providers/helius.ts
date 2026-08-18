@@ -161,7 +161,15 @@ interface RpcResponse<T> {
   error?: { code: number; message: string };
 }
 
-async function rpc<T>(method: string, params: unknown[]): Promise<T> {
+/**
+ * JSON-RPC call.
+ *
+ * `params` is passed through as-is: standard Solana methods take a positional
+ * array, while the DAS methods (getAsset, getAssetBatch, searchAssets) take a
+ * named object. Forcing an array on a DAS method yields
+ * "invalid type: map, expected a sequence".
+ */
+async function rpc<T>(method: string, params: unknown[] | Record<string, unknown>): Promise<T> {
   const body = JSON.stringify({ jsonrpc: '2.0', id: method, method, params });
   const response = await request<RpcResponse<T>>(config.solana.rpcUrl, {
     method: 'POST',
@@ -229,6 +237,75 @@ export async function getTokenBalances(owner: string): Promise<TokenAccountBalan
 export async function getSolBalance(owner: string): Promise<number> {
   const result = await rpc<{ value: number }>('getBalance', [owner, { commitment: 'confirmed' }]);
   return (result?.value ?? 0) / 1e9;
+}
+
+export interface AssetMetadata {
+  mint: string;
+  symbol: string | null;
+  name: string | null;
+  decimals: number | null;
+  imageUri: string | null;
+  /** USD price per token, when the indexer has one. */
+  priceUsd: number | null;
+}
+
+/**
+ * Batched token metadata AND pricing via the DAS `getAssetBatch` method.
+ *
+ * This is the workhorse for portfolio inventory: one RPC call resolves up to
+ * 1000 mints to symbol, name, image, decimals and price. The alternative —
+ * per-mint Birdeye lookups — costs one ~1s request each on a free key, which
+ * made valuing a 124-token wallet take minutes.
+ *
+ * Prices here come from the indexer and can be staler or thinner than a
+ * dedicated price feed, so callers should still prefer Birdeye for the mints
+ * that matter most (quote legs, tracked memes) and use these for the long tail.
+ */
+export async function getAssetsBatch(mints: string[]): Promise<Map<string, AssetMetadata>> {
+  const out = new Map<string, AssetMetadata>();
+  if (!mints.length) return out;
+
+  const unique = [...new Set(mints)];
+
+  for (let i = 0; i < unique.length; i += 1000) {
+    const batch = unique.slice(i, i + 1000);
+    try {
+      const assets = await rpc<
+        Array<{
+          id: string;
+          content?: {
+            metadata?: { symbol?: string; name?: string };
+            links?: { image?: string };
+          };
+          token_info?: {
+            decimals?: number;
+            symbol?: string;
+            price_info?: { price_per_token?: number };
+          };
+        } | null>
+      >('getAssetBatch', { ids: batch });
+
+      for (const asset of assets ?? []) {
+        if (!asset?.id) continue;
+        const meta = asset.content?.metadata ?? {};
+        const info = asset.token_info ?? {};
+        const price = info.price_info?.price_per_token;
+        out.set(asset.id, {
+          mint: asset.id,
+          symbol: meta.symbol || info.symbol || null,
+          name: meta.name || null,
+          decimals: info.decimals ?? null,
+          imageUri: asset.content?.links?.image ?? null,
+          priceUsd: typeof price === 'number' && Number.isFinite(price) && price > 0 ? price : null,
+        });
+      }
+    } catch (error) {
+      // Metadata is enrichment; a failure must not sink a portfolio snapshot.
+      console.warn('[helius] getAssetBatch failed:', (error as Error).message);
+    }
+  }
+
+  return out;
 }
 
 /** Signature list for an address — cheap way to gauge activity without parsing. */

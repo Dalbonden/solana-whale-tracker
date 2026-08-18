@@ -21,16 +21,45 @@ export interface SnapshotResult {
   score: number;
 }
 
-/** Holdings below this are noise — dust, airdrops, worthless rug remnants. */
+/**
+ * Priced holdings below this are noise — dust, airdrops, rug remnants.
+ * Applied ONLY to holdings we could price: a position with no price source is
+ * kept regardless, because "we could not value it" is not the same claim as
+ * "it is worth less than $25".
+ */
 const MIN_HOLDING_USD = 25;
+
+/**
+ * Cap on unpriced positions retained per snapshot, largest balance first.
+ * Whale wallets accumulate long tails of spam airdrops; keeping every one would
+ * bloat the table without telling anyone anything.
+ */
+const MAX_UNPRICED_HOLDINGS = 60;
+
+/**
+ * Days a wallet must be tracked before our own trade history is treated as a
+ * complete picture of its 30-day activity rather than a partial sample.
+ */
+const HISTORY_MATURITY_DAYS = 7;
 
 export async function snapshotWhale(whale: Whale): Promise<SnapshotResult> {
   const snapshotAt = new Date().toISOString();
   const portfolio = await collectPortfolioMetrics(whale.address);
 
-  const significant = portfolio.holdings.filter((holding) => holding.usdValue >= MIN_HOLDING_USD);
+  // Priced positions worth keeping...
+  const priced = portfolio.holdings.filter(
+    (holding) => !holding.unpriced && holding.usdValue >= MIN_HOLDING_USD
+  );
 
-  const rows: Partial<PortfolioHolding>[] = significant.map((holding) => ({
+  // ...plus the wallet's unpriced inventory, biggest balances first. These are
+  // real holdings; they simply have no price feed, so they carry a null price
+  // and contribute nothing to portfolio value.
+  const unpriced = portfolio.holdings
+    .filter((holding) => holding.unpriced && holding.amount > 0)
+    .sort((a, b) => b.amount - a.amount)
+    .slice(0, MAX_UNPRICED_HOLDINGS);
+
+  const rows: Partial<PortfolioHolding>[] = [...priced, ...unpriced].map((holding) => ({
     whale_address: whale.address,
     token_mint: holding.mint,
     token_symbol: holding.symbol,
@@ -45,18 +74,44 @@ export async function snapshotWhale(whale: Whale): Promise<SnapshotResult> {
 
   await insertPortfolioSnapshot(rows);
 
-  // Rescore with the fresh portfolio plus stored 30-day activity.
   const stats = await getWhaleActivityStats(whale.address);
+
+  /*
+   * Our trade history begins when tracking begins, so for a recently
+   * discovered wallet it is not "trades in the last 30 days" — it is "trades
+   * since we started watching", which is a far smaller number.
+   *
+   * Rescoring naively on that collapses every fresh whale to shrimp minutes
+   * after discovery: a wallet with 1,494 real trades gets rescored on the 2 we
+   * happened to capture. So until we have watched a wallet long enough for our
+   * own history to be representative, we never let a rescore report LESS
+   * activity than is already on record.
+   *
+   * After that point our observations are authoritative and activity is allowed
+   * to decay, which is what makes a wallet that stops trading drift down the
+   * leaderboard on its own.
+   */
+  const trackedMs = Date.now() - new Date(whale.first_seen_at ?? Date.now()).getTime();
+  const historyIsRepresentative = trackedMs >= HISTORY_MATURITY_DAYS * 24 * 3600 * 1000;
+
+  const keepHigher = (observed: number, recorded: number | null | undefined) =>
+    historyIsRepresentative ? observed : Math.max(observed, recorded ?? 0);
+
+  const tradeCount30d = keepHigher(stats.tradeCount, whale.trade_count_30d);
+  const avgTradeSizeUsd = keepHigher(stats.avgUsd, whale.avg_trade_size_usd);
+  const maxTradeSizeUsd = keepHigher(stats.maxUsd, whale.max_trade_size_usd);
+  const distinctTokens30d = keepHigher(stats.distinctTokens, whale.distinct_tokens_30d);
+
   const score = scoreWallet({
     address: whale.address,
     portfolioValueUsd: portfolio.totalUsd,
     memeValueUsd: portfolio.memeUsd,
     memeExposurePct: portfolio.totalUsd > 0 ? portfolio.memeUsd / portfolio.totalUsd : 0,
-    tradeCount30d: stats.tradeCount,
-    avgTradeSizeUsd: stats.avgUsd,
-    maxTradeSizeUsd: stats.maxUsd,
-    distinctTokens30d: stats.distinctTokens,
-    realizedPnlUsd: 0,
+    tradeCount30d,
+    avgTradeSizeUsd,
+    maxTradeSizeUsd,
+    distinctTokens30d,
+    realizedPnlUsd: whale.realized_pnl_usd ?? 0,
     winRate: null,
     lastActiveAt: stats.lastActiveAt,
   });
@@ -68,10 +123,10 @@ export async function snapshotWhale(whale: Whale): Promise<SnapshotResult> {
       meme_value_usd: Number(portfolio.memeUsd.toFixed(2)),
       meme_exposure_pct:
         portfolio.totalUsd > 0 ? Number((portfolio.memeUsd / portfolio.totalUsd).toFixed(4)) : 0,
-      trade_count_30d: stats.tradeCount,
-      avg_trade_size_usd: Number(stats.avgUsd.toFixed(2)),
-      max_trade_size_usd: Number(stats.maxUsd.toFixed(2)),
-      distinct_tokens_30d: stats.distinctTokens,
+      trade_count_30d: tradeCount30d,
+      avg_trade_size_usd: Number(avgTradeSizeUsd.toFixed(2)),
+      max_trade_size_usd: Number(maxTradeSizeUsd.toFixed(2)),
+      distinct_tokens_30d: distinctTokens30d,
       score: score.score,
       tier: score.tier,
       last_active_at: stats.lastActiveAt?.toISOString() ?? whale.last_active_at,

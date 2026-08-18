@@ -65,6 +65,23 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
    */
   const effectiveTradeSize = Math.max(metrics.maxTradeSizeUsd, metrics.avgTradeSizeUsd);
 
+  /*
+   * Meme engagement = holdings exposure OR trading flow.
+   *
+   * Measuring exposure purely from a point-in-time snapshot systematically
+   * penalises the most active meme traders: a wallet that flips memes all day
+   * and parks in SOL overnight shows ~1% exposure, while a dormant bag-holder
+   * shows 90%. Observed rejections were dominated by this — candidates pulled
+   * from a meme-token top-trader list, rejected for "meme exposure 1.4% < 5%".
+   *
+   * Trading the tracked meme universe is exposure to meme markets, just held as
+   * flow rather than inventory, so it counts. Holdings still dominate when they
+   * exist; flow only sets a floor, and is capped below 1 so a pure flipper
+   * never outscores someone doing both.
+   */
+  const flowEngagement = linNorm(metrics.tradeCount30d, 5, 120) * 0.7;
+  const memeEngagement = Math.min(Math.max(metrics.memeExposurePct, flowEngagement), 1);
+
   const components = {
     // $50k → 0, $50M → 1
     portfolio: logNorm(metrics.portfolioValueUsd, 50_000, 50_000_000),
@@ -72,7 +89,7 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
     tradeSize: logNorm(effectiveTradeSize, 5_000, 5_000_000),
     // 2 trades/30d → 0, 150 → 1
     frequency: linNorm(metrics.tradeCount30d, 2, 150),
-    memeExposure: Math.min(metrics.memeExposurePct, 1),
+    memeExposure: memeEngagement,
     // 1 token → 0, 12 → 1
     diversity: linNorm(metrics.distinctTokens30d, 1, 12),
   };
@@ -92,7 +109,10 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
   const clearsPortfolio = metrics.portfolioValueUsd >= detection.minPortfolioUsd;
   const clearsTradeSize = effectiveTradeSize >= detection.minTradeUsd;
   const clearsFrequency = metrics.tradeCount30d >= detection.minTrades30d;
-  const clearsExposure = metrics.memeExposurePct >= detection.minMemeExposure;
+  // Satisfied by holdings OR by active trading in the tracked meme universe.
+  const clearsExposure =
+    metrics.memeExposurePct >= detection.minMemeExposure ||
+    metrics.tradeCount30d >= detection.minTrades30d;
 
   if (!clearsPortfolio) {
     reasons.push(
@@ -104,7 +124,8 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
   }
   if (!clearsExposure) {
     reasons.push(
-      `meme exposure ${(metrics.memeExposurePct * 100).toFixed(1)}% < ${(detection.minMemeExposure * 100).toFixed(0)}%`
+      `no meme engagement: exposure ${(metrics.memeExposurePct * 100).toFixed(1)}% < ` +
+        `${(detection.minMemeExposure * 100).toFixed(0)}% and only ${metrics.tradeCount30d} trades in 30d`
     );
   }
   if (rounded < detection.minScore) {
@@ -133,90 +154,93 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
  * falls back to RPC balances + a batch price lookup when Birdeye is unavailable
  * or returns nothing.
  */
+export interface Holding {
+  mint: string;
+  symbol: string | null;
+  name: string | null;
+  logoUri: string | null;
+  amount: number;
+  usdValue: number;
+  priceUsd: number | null;
+  isMeme: boolean;
+  /** True when no price source covered this mint, so usdValue is 0 not "worthless". */
+  unpriced: boolean;
+}
+
 export async function collectPortfolioMetrics(address: string): Promise<{
   totalUsd: number;
   memeUsd: number;
-  holdings: Array<{ mint: string; symbol: string | null; amount: number; usdValue: number; priceUsd: number | null; isMeme: boolean }>;
+  holdings: Holding[];
 }> {
   const memeMints = await getTrackedMints();
-  const holdings: Array<{
-    mint: string;
-    symbol: string | null;
-    amount: number;
-    usdValue: number;
-    priceUsd: number | null;
-    isMeme: boolean;
-  }> = [];
+  const holdings: Holding[] = [];
 
-  const birdeyeItems = await birdeye.getWalletPortfolio(address);
+  /*
+   * Full wallet inventory, not just the tokens we track.
+   *
+   * Balances come from one RPC call, then Helius DAS `getAssetBatch` resolves
+   * every mint to symbol/name/image/price in a single batched request. That is
+   * what makes a complete inventory affordable: pricing 124 positions through
+   * per-mint Birdeye calls would take minutes on a free key, which is exactly
+   * what made discovery time out earlier.
+   *
+   * Birdeye is still consulted, but only for the mints that must be accurate —
+   * SOL, stables and tracked meme tokens — since those drive the score and the
+   * trade valuations. DAS prices cover the long tail.
+   *
+   * Positions DAS cannot price are still recorded, with `unpriced: true` and a
+   * zero value. They are inventory the wallet genuinely holds; omitting them
+   * would misrepresent the portfolio as smaller than it is.
+   */
+  const [balances, solBalance] = await Promise.all([
+    helius.getTokenBalances(address),
+    helius.getSolBalance(address),
+  ]);
 
-  if (birdeyeItems.length) {
-    for (const item of birdeyeItems) {
-      const usdValue = item.valueUsd ?? 0;
-      if (usdValue <= 0) continue;
-      holdings.push({
-        mint: item.address,
-        symbol: item.symbol ?? null,
-        amount: item.uiAmount ?? 0,
-        usdValue,
-        priceUsd: item.priceUsd ?? null,
-        isMeme: memeMints.has(item.address) && !NON_MEME_MINTS.has(item.address),
-      });
-    }
-  } else {
-    const [balances, solBalance] = await Promise.all([
-      helius.getTokenBalances(address),
-      helius.getSolBalance(address),
-    ]);
+  const allMints = balances.map((balance) => balance.mint);
+  const metadata = await helius.getAssetsBatch(allMints);
 
-    /*
-     * Price only mints we can meaningfully value, never the whole wallet.
-     *
-     * A whale wallet routinely holds hundreds of SPL accounts — airdrops, dust,
-     * dead rugs. On a Birdeye plan without `multi_price` each price is its own
-     * ~1/sec request, so pricing everything costs minutes per wallet and makes
-     * discovery time out. Restricting to the tracked meme universe plus the
-     * known quote/blue-chip mints keeps it to a couple of dozen lookups that
-     * cache well across wallets.
-     *
-     * The trade-off is explicit: `portfolio_value_usd` means "SOL, stables,
-     * blue chips and tracked meme tokens" — not every long-tail position. That
-     * is the figure the whale score is actually about, and it is stable rather
-     * than dominated by unpriceable junk.
-     */
-    const priceable = balances
-      .map((balance) => balance.mint)
-      .filter((mint) => memeMints.has(mint) || NON_MEME_MINTS.has(mint));
+  // Accurate pricing only where it matters; DAS covers everything else.
+  const priorityMints = allMints.filter(
+    (mint) => memeMints.has(mint) || NON_MEME_MINTS.has(mint)
+  );
+  if (solBalance > 0) priorityMints.push(NATIVE_SOL);
+  const prices = await birdeye.getPrices(priorityMints);
 
-    const mints = [...priceable];
-    if (solBalance > 0) mints.push(NATIVE_SOL);
-    const prices = await birdeye.getPrices(mints);
+  const priceFor = (mint: string): number | null =>
+    prices.get(mint) ?? metadata.get(mint)?.priceUsd ?? null;
 
-    if (solBalance > 0) {
-      const solPrice = prices.get(NATIVE_SOL) ?? 0;
-      holdings.push({
-        mint: NATIVE_SOL,
-        symbol: 'SOL',
-        amount: solBalance,
-        usdValue: solBalance * solPrice,
-        priceUsd: solPrice || null,
-        isMeme: false,
-      });
-    }
+  if (solBalance > 0) {
+    const solPrice = priceFor(NATIVE_SOL) ?? 0;
+    holdings.push({
+      mint: NATIVE_SOL,
+      symbol: 'SOL',
+      name: 'Solana',
+      logoUri: null,
+      amount: solBalance,
+      usdValue: solBalance * solPrice,
+      priceUsd: solPrice || null,
+      isMeme: false,
+      unpriced: solPrice <= 0,
+    });
+  }
 
-    for (const balance of balances) {
-      const price = prices.get(balance.mint) ?? 0;
-      const usdValue = balance.amount * price;
-      if (usdValue <= 0) continue;
-      holdings.push({
-        mint: balance.mint,
-        symbol: null,
-        amount: balance.amount,
-        usdValue,
-        priceUsd: price || null,
-        isMeme: memeMints.has(balance.mint) && !NON_MEME_MINTS.has(balance.mint),
-      });
-    }
+  for (const balance of balances) {
+    const meta = metadata.get(balance.mint);
+    const price = priceFor(balance.mint);
+    const usdValue = price ? balance.amount * price : 0;
+
+    holdings.push({
+      mint: balance.mint,
+      symbol: meta?.symbol ?? null,
+      name: meta?.name ?? null,
+      logoUri: meta?.imageUri ?? null,
+      amount: balance.amount,
+      usdValue,
+      priceUsd: price,
+      isMeme: memeMints.has(balance.mint) && !NON_MEME_MINTS.has(balance.mint),
+      unpriced: price === null,
+    });
   }
 
   const totalUsd = holdings.reduce((sum, holding) => sum + holding.usdValue, 0);

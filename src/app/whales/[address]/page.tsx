@@ -74,6 +74,9 @@ export default async function WhaleProfilePage({ params }: { params: { address: 
   const { whale, portfolio, timeline, trades, alerts } = data;
 
   const memeHoldings = portfolio.filter((holding) => holding.is_meme);
+  // A null price means no feed covered the mint — not that it is worthless.
+  const pricedHoldings = portfolio.filter((h) => h.price_usd !== null);
+  const unpricedHoldings = portfolio.filter((h) => h.price_usd === null);
   const currentValue = portfolio.reduce((sum, holding) => sum + holding.usd_value, 0);
   const memeValue = memeHoldings.reduce((sum, holding) => sum + holding.usd_value, 0);
 
@@ -200,39 +203,53 @@ export default async function WhaleProfilePage({ params }: { params: { address: 
                     </TableCell>
                   </TableRow>
                 )}
-                {portfolio.map((holding) => (
-                  <TableRow key={holding.token_mint}>
-                    <TableCell>
-                      <Link
-                        href={`/tokens/${holding.token_mint}`}
-                        className="text-sm font-medium hover:text-primary"
-                      >
-                        {holding.token_symbol ?? shortenAddress(holding.token_mint)}
-                      </Link>
-                    </TableCell>
-                    <TableCell className="tabular text-right text-xs">
-                      {formatAmount(holding.amount)}
-                    </TableCell>
-                    <TableCell className="tabular text-right text-xs text-muted-foreground">
-                      {formatPrice(holding.price_usd)}
-                    </TableCell>
-                    <TableCell className="tabular text-right font-medium">
-                      {formatUsd(holding.usd_value)}
-                    </TableCell>
-                    <TableCell className="tabular text-right text-xs text-muted-foreground">
-                      {holding.pct_of_portfolio
-                        ? `${(holding.pct_of_portfolio * 100).toFixed(1)}%`
-                        : '—'}
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={holding.is_meme ? 'default' : 'outline'}>
-                        {holding.is_meme ? 'meme' : 'other'}
-                      </Badge>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {[...pricedHoldings, ...unpricedHoldings].map((holding) => {
+                  const noPrice = holding.price_usd === null;
+                  return (
+                    <TableRow key={holding.token_mint} className={noPrice ? 'opacity-70' : ''}>
+                      <TableCell>
+                        <Link
+                          href={`/tokens/${holding.token_mint}`}
+                          className="text-sm font-medium hover:text-primary"
+                        >
+                          {holding.token_symbol ?? shortenAddress(holding.token_mint)}
+                        </Link>
+                      </TableCell>
+                      <TableCell className="tabular text-right text-xs">
+                        {formatAmount(holding.amount)}
+                      </TableCell>
+                      <TableCell className="tabular text-right text-xs text-muted-foreground">
+                        {noPrice ? 'no feed' : formatPrice(holding.price_usd)}
+                      </TableCell>
+                      <TableCell className="tabular text-right font-medium">
+                        {noPrice ? (
+                          <span className="text-muted-foreground">unpriced</span>
+                        ) : (
+                          formatUsd(holding.usd_value)
+                        )}
+                      </TableCell>
+                      <TableCell className="tabular text-right text-xs text-muted-foreground">
+                        {holding.pct_of_portfolio && !noPrice
+                          ? `${(holding.pct_of_portfolio * 100).toFixed(1)}%`
+                          : '—'}
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={holding.is_meme ? 'default' : 'outline'}>
+                          {holding.is_meme ? 'meme' : noPrice ? 'unpriced' : 'other'}
+                        </Badge>
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
+            {unpricedHoldings.length > 0 && (
+              <p className="border-t border-border px-3 py-2 text-[11px] text-muted-foreground">
+                {pricedHoldings.length} priced · {unpricedHoldings.length} unpriced. Unpriced
+                positions are held on-chain but no price feed covers them, so they are excluded
+                from portfolio value rather than counted as $0.
+              </p>
+            )}
           </div>
         </TabsContent>
 

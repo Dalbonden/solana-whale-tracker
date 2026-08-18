@@ -107,3 +107,14 @@
   background: hsl(var(--muted-foreground) / 0.5);
   background-clip: content-box;
 }
+
+/*
+ * Signature face. `latin-ext` is required for the "ä" in Hillebäck — the
+ * default `latin` subset would drop it. Falls back to a system script stack if
+ * the request is blocked or slow, so the signature always renders as something.
+ */
+.signature-name {
+  font-family: 'Great Vibes', 'Segoe Script', 'Brush Script MT', 'Apple Chancery', cursive;
+  font-weight: 400;
+  letter-spacing: 0.01em;
+}
