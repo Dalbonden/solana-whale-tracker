@@ -245,7 +245,15 @@ export async function insertTrades(trades: Partial<WhaleTrade>[]): Promise<Whale
 export async function getPositionHistory(
   whale: string,
   mint: string
-): Promise<{ boughtAmount: number; soldAmount: number; boughtUsd: number; soldUsd: number; tradeCount: number }> {
+): Promise<{
+  boughtAmount: number;
+  soldAmount: number;
+  boughtUsd: number;
+  soldUsd: number;
+  tradeCount: number;
+  /** Average USD cost per token across observed buys, or null if none seen. */
+  avgCostUsd: number | null;
+}> {
   const { data, error } = await db()
     .from('whale_trades')
     .select('side, token_amount, usd_value')
@@ -270,7 +278,16 @@ export async function getPositionHistory(
     }
   }
 
-  return { boughtAmount, soldAmount, boughtUsd, soldUsd, tradeCount: (data ?? []).length };
+  return {
+    boughtAmount,
+    soldAmount,
+    boughtUsd,
+    soldUsd,
+    tradeCount: (data ?? []).length,
+    // Average cost basis. Null when we never observed a buy — the position was
+    // opened before tracking began, so its basis is genuinely unknown.
+    avgCostUsd: boughtAmount > 0 && boughtUsd > 0 ? boughtUsd / boughtAmount : null,
+  };
 }
 
 /** 30-day activity stats used by the scorer. */

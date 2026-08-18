@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 
 import { PriceChart } from '@/components/price-chart';
+import { TokenRiskPanel } from '@/components/token-risk-panel';
 import { SetupNotice } from '@/components/setup-notice';
 import { StatCards, type Stat } from '@/components/stat-cards';
 import { TradeHistory } from '@/components/trade-history';
@@ -142,6 +143,17 @@ export default async function TokenPage({ params }: { params: { mint: string } }
           </CardContent>
         </Card>
 
+        <Card className="min-w-0">
+          <CardHeader>
+            <CardTitle>Holder concentration &amp; rug risk</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <TokenRiskPanel mint={mint} />
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid gap-6 lg:grid-cols-[1fr_360px]">
         <Card className="min-w-0">
           <CardHeader>
             <CardTitle>Whale positioning (7d)</CardTitle>

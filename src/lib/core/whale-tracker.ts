@@ -77,11 +77,12 @@ export async function persistSwaps(swaps: ParsedSwap[]): Promise<IngestResult> {
 
   for (const swap of ordered) {
     const { usdValue, priceUsd } = valueSwapUsd(swap, prices);
-    const { isNewPosition, isFullExit } = await classifyPosition(
+    const position = await classifyPosition(
       swap.wallet,
       swap.tokenMint,
       swap.side,
-      swap.tokenAmount
+      swap.tokenAmount,
+      usdValue
     );
 
     rows.push({
@@ -99,8 +100,11 @@ export async function persistSwaps(swaps: ParsedSwap[]): Promise<IngestResult> {
       quote_amount: swap.quoteAmount,
       usd_value: Number(usdValue.toFixed(2)),
       price_usd: priceUsd,
-      is_new_position: isNewPosition,
-      is_full_exit: isFullExit,
+      is_new_position: position.isNewPosition,
+      is_full_exit: position.isFullExit,
+      cost_basis_usd: position.costBasisUsd,
+      realized_pnl_usd: position.realizedPnlUsd,
+      realized_pnl_pct: position.realizedPnlPct,
       raw: null,
     });
   }

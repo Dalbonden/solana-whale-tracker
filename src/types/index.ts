@@ -79,6 +79,11 @@ export interface WhaleTrade {
   price_usd: number | null;
   is_new_position: boolean;
   is_full_exit: boolean;
+  /** Cost of the sold tokens, from observed buys. Null when basis is unknown. */
+  cost_basis_usd: number | null;
+  /** Profit/loss on a sell. Null for buys and for unknown-basis sells. */
+  realized_pnl_usd: number | null;
+  realized_pnl_pct: number | null;
   raw: unknown;
   created_at: string;
 }

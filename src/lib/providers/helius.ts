@@ -233,6 +233,67 @@ export async function getTokenBalances(owner: string): Promise<TokenAccountBalan
   return [...balances.values()];
 }
 
+export interface MintInfo {
+  mintAuthority: string | null;
+  freezeAuthority: string | null;
+  decimals: number;
+  uiSupply: number;
+}
+
+/**
+ * Mint account details — the two authorities and total supply.
+ *
+ * A live `mintAuthority` means supply can be inflated arbitrarily and a live
+ * `freezeAuthority` means balances can be frozen; both are hard rug vectors and
+ * both are visible here for free.
+ */
+export async function getMintInfo(mint: string): Promise<MintInfo | null> {
+  const result = await rpc<{
+    value: {
+      data?: {
+        parsed?: {
+          info?: {
+            mintAuthority: string | null;
+            freezeAuthority: string | null;
+            decimals: number;
+            supply: string;
+          };
+        };
+      };
+    } | null;
+  }>('getAccountInfo', [mint, { encoding: 'jsonParsed', commitment: 'confirmed' }]);
+
+  const info = result?.value?.data?.parsed?.info;
+  if (!info) return null;
+
+  const decimals = info.decimals ?? 0;
+  const raw = Number(info.supply ?? 0);
+
+  return {
+    mintAuthority: info.mintAuthority ?? null,
+    freezeAuthority: info.freezeAuthority ?? null,
+    decimals,
+    uiSupply: Number.isFinite(raw) ? raw / 10 ** decimals : 0,
+  };
+}
+
+/**
+ * Metadata update authority for a mint, via DAS `getAsset`.
+ *
+ * The closest on-chain proxy for "who deployed this". Callers must check it
+ * against known platform authorities before calling it a creator.
+ */
+export async function getUpdateAuthority(mint: string): Promise<string | null> {
+  try {
+    const asset = await rpc<{
+      authorities?: Array<{ address: string; scopes?: string[] }>;
+    }>('getAsset', { id: mint });
+    return asset?.authorities?.[0]?.address ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Native SOL balance in SOL units. */
 export async function getSolBalance(owner: string): Promise<number> {
   const result = await rpc<{ value: number }>('getBalance', [owner, { commitment: 'confirmed' }]);

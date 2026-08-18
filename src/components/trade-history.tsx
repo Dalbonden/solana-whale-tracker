@@ -35,6 +35,7 @@ export function TradeHistory({
             <TableHead className="text-right">Amount</TableHead>
             <TableHead className="text-right">Price</TableHead>
             <TableHead className="text-right">Value</TableHead>
+            <TableHead className="text-right">P&amp;L</TableHead>
             <TableHead>Venue</TableHead>
             <TableHead className="w-8" />
           </TableRow>
@@ -44,7 +45,7 @@ export function TradeHistory({
           {trades.length === 0 && (
             <TableRow>
               <TableCell
-                colSpan={showWhale ? 9 : 8}
+                colSpan={showWhale ? 10 : 9}
                 className="py-10 text-center text-sm text-muted-foreground"
               >
                 {emptyMessage}
@@ -111,6 +112,38 @@ export function TradeHistory({
                   )}
                 >
                   {formatUsd(trade.usd_value)}
+                </TableCell>
+
+                <TableCell className="tabular text-right text-xs">
+                  {trade.realized_pnl_usd === null || trade.realized_pnl_usd === undefined ? (
+                    <span
+                      className="text-muted-foreground"
+                      title={
+                        isBuy
+                          ? 'P&L is realised on the sell, not the buy'
+                          : 'This position was opened before tracking began, so its cost basis is unknown'
+                      }
+                    >
+                      —
+                    </span>
+                  ) : (
+                    <span
+                      className={
+                        trade.realized_pnl_usd >= 0
+                          ? 'text-[hsl(var(--bull))]'
+                          : 'text-[hsl(var(--bear))]'
+                      }
+                    >
+                      {trade.realized_pnl_usd >= 0 ? '+' : ''}
+                      {formatUsd(trade.realized_pnl_usd)}
+                      {trade.realized_pnl_pct !== null && trade.realized_pnl_pct !== undefined && (
+                        <span className="ml-1 opacity-70">
+                          ({trade.realized_pnl_pct >= 0 ? '+' : ''}
+                          {(trade.realized_pnl_pct * 100).toFixed(0)}%)
+                        </span>
+                      )}
+                    </span>
+                  )}
                 </TableCell>
 
                 <TableCell className="text-xs capitalize text-muted-foreground">
