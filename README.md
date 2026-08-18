@@ -68,7 +68,7 @@ src/
 │       ├── stream/route.ts            SSE live feed
 │       ├── health/route.ts            integration status
 │       ├── webhooks/helius/route.ts   real-time ingest
-│       └── cron/{sync,discover,tokens,portfolios,webhook-sync}/route.ts
+│       └── cron/{sync,discover,tokens,portfolios,webhook-sync,rebuild-positions}/route.ts
 ├── components/                        dashboard UI (shadcn-style primitives in ui/)
 ├── hooks/use-live-feed.ts             EventSource subscription
 ├── lib/
@@ -239,6 +239,7 @@ GET /api/cron/discover?max=120
 GET /api/cron/tokens?discover=true
 GET /api/cron/portfolios?limit=60&prune=true
 GET /api/cron/webhook-sync
+GET /api/cron/rebuild-positions        # replay trades into the position ledger
 ```
 
 ---

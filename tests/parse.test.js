@@ -1,6 +1,6 @@
 const assert = require('node:assert');
 const { test } = require('node:test');
-const { parseSwaps, valueSwapUsd, computeBalanceDeltas } = require('../.test-build/parse.js');
+const { parseSwaps, valueSwapUsd, computeBalanceDeltas } = require('../.test-build/solana/parse.js');
 
 const WHALE = 'HN7cABqLq46Es1jh92dQQisAq662SmxELLLsHHe4YWrH';
 const WIF = 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm';

@@ -88,6 +88,36 @@ export interface WhaleTrade {
   created_at: string;
 }
 
+/**
+ * One entry → exit cycle. A re-entry after a full exit is a separate row, which
+ * is what keeps hold duration and per-cycle P&L meaningful.
+ */
+export interface WhalePosition {
+  id: string;
+  whale_address: string;
+  token_mint: string;
+  token_symbol: string | null;
+  /** Signature of the trade that opened this cycle — the cycle's identity. */
+  opened_by_signature: string;
+  status: 'open' | 'closed';
+  /** Units still held. */
+  amount: number;
+  /** Basis of the remaining units only — sells retire their share. */
+  cost_basis_usd: number;
+  avg_entry_price: number | null;
+  total_bought_usd: number;
+  total_sold_usd: number;
+  realized_pnl_usd: number;
+  buy_count: number;
+  sell_count: number;
+  /** False when the entry predates tracking, making P&L unknowable. */
+  basis_complete: boolean;
+  opened_at: string;
+  closed_at: string | null;
+  last_trade_at: string;
+  updated_at: string;
+}
+
 export interface PortfolioHolding {
   whale_address: string;
   token_mint: string;

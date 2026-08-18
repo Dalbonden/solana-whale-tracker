@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "test": "node scripts/test.mjs",
     "db:push": "node scripts/apply-schema.mjs",
-    "bootstrap": "node scripts/bootstrap.mjs"
+    "bootstrap": "node scripts/bootstrap.mjs",
+    "positions:rebuild": "node scripts/rebuild-positions.mjs"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.2",

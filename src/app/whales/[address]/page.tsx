@@ -5,6 +5,7 @@ import { notFound } from 'next/navigation';
 
 import { AlertList } from '@/components/alert-list';
 import { PortfolioAllocation, PortfolioTimeline } from '@/components/portfolio-chart';
+import { PositionsTable } from '@/components/positions-table';
 import { SetupNotice } from '@/components/setup-notice';
 import { StatCards, type Stat } from '@/components/stat-cards';
 import { TradeHistory } from '@/components/trade-history';
@@ -19,11 +20,14 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { derivePositionView } from '@/lib/core/positions';
 import {
   getCurrentPortfolio,
   getPortfolioTimeline,
+  getTokenPrices,
   getWhale,
   listAlerts,
+  listPositions,
   listTrades,
 } from '@/lib/db/repositories';
 import { EXPLORERS } from '@/lib/solana/constants';
@@ -58,20 +62,35 @@ export default async function WhaleProfilePage({ params }: { params: { address: 
     const whale = await getWhale(address);
     if (!whale) notFound();
 
-    const [portfolio, timeline, trades, alerts] = await Promise.all([
+    const [portfolio, timeline, trades, alerts, positions] = await Promise.all([
       getCurrentPortfolio(address),
       getPortfolioTimeline(address, 30),
       listTrades({ whale: address, pageSize: 100 }),
       listAlerts({ whale: address, pageSize: 25 }),
+      listPositions(address),
     ]);
 
-    data = { whale, portfolio, timeline, trades, alerts };
+    // Positions are marked against the token cache rather than a live quote:
+    // the cron refreshes it every few minutes, and a page render should not
+    // fan out to a price API per holding.
+    const prices = await getTokenPrices(positions.map((p) => p.token_mint));
+
+    // Conviction is measured against the priced portfolio, not the stored
+    // whale total — the latter is a snapshot that may predate today's moves.
+    const bookValue =
+      portfolio.reduce((sum, holding) => sum + holding.usd_value, 0) || whale.portfolio_value_usd;
+
+    const positionViews = positions.map((position) =>
+      derivePositionView(position, prices.get(position.token_mint) ?? null, bookValue)
+    );
+
+    data = { whale, portfolio, timeline, trades, alerts, positions: positionViews };
   } catch (error) {
     if ((error as Error).message === 'NEXT_NOT_FOUND') throw error;
     return <SetupNotice error={(error as Error).message} />;
   }
 
-  const { whale, portfolio, timeline, trades, alerts } = data;
+  const { whale, portfolio, timeline, trades, alerts, positions } = data;
 
   const memeHoldings = portfolio.filter((holding) => holding.is_meme);
   // A null price means no feed covered the mint — not that it is worthless.
@@ -87,8 +106,30 @@ export default async function WhaleProfilePage({ params }: { params: { address: 
     else soldUsd += trade.usd_value;
   }
 
+  const openPositions = positions.filter((position) => position.status === 'open');
+
+  // Only positions whose entry we actually observed can be marked. Summing the
+  // rest as zero would quietly report a smaller loss than reality.
+  const markable = openPositions.filter((position) => position.unrealized_pnl_usd !== null);
+  const unrealizedUsd = markable.reduce((sum, p) => sum + (p.unrealized_pnl_usd ?? 0), 0);
+  const markedCostBasis = markable.reduce((sum, p) => sum + p.cost_basis_usd, 0);
+
   const cards: Stat[] = [
     { label: 'Portfolio', value: formatUsd(currentValue || whale.portfolio_value_usd) },
+    {
+      label: 'Unrealised P&L',
+      value: markable.length
+        ? `${unrealizedUsd >= 0 ? '+' : ''}${formatUsd(unrealizedUsd)}`
+        : '—',
+      tone: markable.length === 0 ? undefined : unrealizedUsd >= 0 ? 'bull' : 'bear',
+      hint: markable.length
+        ? `${markable.length}/${openPositions.length} open positions priced${
+            markedCostBasis > 0
+              ? ` · ${unrealizedUsd >= 0 ? '+' : ''}${((unrealizedUsd / markedCostBasis) * 100).toFixed(0)}%`
+              : ''
+          }`
+        : 'no open position has a known entry yet',
+    },
     {
       label: 'Meme exposure',
       value: formatPercent(
@@ -171,6 +212,7 @@ export default async function WhaleProfilePage({ params }: { params: { address: 
       <Tabs defaultValue="trades">
         <TabsList>
           <TabsTrigger value="trades">Trades ({trades.count})</TabsTrigger>
+          <TabsTrigger value="positions">Positions ({positions.length})</TabsTrigger>
           <TabsTrigger value="holdings">Holdings ({portfolio.length})</TabsTrigger>
           <TabsTrigger value="alerts">Alerts ({alerts.count})</TabsTrigger>
         </TabsList>
@@ -179,6 +221,13 @@ export default async function WhaleProfilePage({ params }: { params: { address: 
           <TradeHistory
             trades={trades.rows}
             emptyMessage="No meme-token trades recorded for this wallet yet."
+          />
+        </TabsContent>
+
+        <TabsContent value="positions">
+          <PositionsTable
+            positions={positions}
+            emptyMessage="No positions reconstructed yet. Run /api/cron/rebuild-positions to build them from stored trades."
           />
         </TabsContent>
 

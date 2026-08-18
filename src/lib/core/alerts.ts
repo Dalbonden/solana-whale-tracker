@@ -24,12 +24,7 @@
  */
 
 import { config } from '@/lib/config';
-import {
-  countDistinctBuyers,
-  getPositionHistory,
-  getRecentExits,
-  insertAlerts,
-} from '@/lib/db/repositories';
+import { countDistinctBuyers, getRecentExits, insertAlerts } from '@/lib/db/repositories';
 import * as pumpfun from '@/lib/providers/pumpfun';
 import { EXPLORERS, looksLikePumpfunMint } from '@/lib/solana/constants';
 import type { Alert, AlertSeverity, AlertType, WhaleTrade } from '@/types';
@@ -240,77 +235,3 @@ export async function alertWhaleDiscovered(
   ]);
 }
 
-/**
- * Classifies a trade against the whale's stored position, producing the
- * `is_new_position` / `is_full_exit` flags the rules above depend on.
- */
-export interface PositionClassification {
-  isNewPosition: boolean;
-  isFullExit: boolean;
-  /** Average USD cost of the tokens being sold. Null when never observed. */
-  costBasisUsd: number | null;
-  /** Profit or loss on this sell in USD. Null for buys, or basis unknown. */
-  realizedPnlUsd: number | null;
-  /** Same as a fraction of cost, e.g. 0.42 = +42%. */
-  realizedPnlPct: number | null;
-}
-
-/**
- * Classifies a trade against the whale's observed position and, for sells,
- * scores the profit or loss.
- *
- * P&L uses an average cost basis over the buys we have actually recorded. Our
- * history begins when tracking begins, so a wallet that bought before then has
- * no knowable basis — those sells return null rather than a fabricated figure.
- * Showing "+$40,000 profit" for a position whose entry we never saw would be
- * pure invention, and a P&L column nobody can trust is worse than none.
- */
-export async function classifyPosition(
-  whale: string,
-  mint: string,
-  side: 'buy' | 'sell',
-  tokenAmount: number,
-  usdValue = 0
-): Promise<PositionClassification> {
-  const history = await getPositionHistory(whale, mint);
-  const heldBefore = history.boughtAmount - history.soldAmount;
-
-  if (side === 'buy') {
-    const isNewPosition = history.tradeCount === 0 || heldBefore <= 0;
-    return {
-      isNewPosition,
-      isFullExit: false,
-      costBasisUsd: null,
-      realizedPnlUsd: null,
-      realizedPnlPct: null,
-    };
-  }
-
-  // --- sell ---------------------------------------------------------------
-  const avgCost = history.avgCostUsd;
-
-  // Only score the portion we can actually attribute to observed buys. Selling
-  // more than we ever saw bought means the rest came from an unseen entry.
-  const attributable = avgCost !== null ? Math.min(tokenAmount, Math.max(heldBefore, 0)) : 0;
-
-  let costBasisUsd: number | null = null;
-  let realizedPnlUsd: number | null = null;
-  let realizedPnlPct: number | null = null;
-
-  if (avgCost !== null && attributable > 0 && usdValue > 0) {
-    // Proceeds for the attributable share of the sale.
-    const proceeds = usdValue * (attributable / tokenAmount);
-    costBasisUsd = avgCost * attributable;
-    realizedPnlUsd = proceeds - costBasisUsd;
-    realizedPnlPct = costBasisUsd > 0 ? realizedPnlUsd / costBasisUsd : null;
-  }
-
-  if (heldBefore <= 0) {
-    // Never saw them buy it: cannot claim this closed the position.
-    return { isNewPosition: false, isFullExit: false, costBasisUsd, realizedPnlUsd, realizedPnlPct };
-  }
-
-  const remaining = heldBefore - tokenAmount;
-  const isFullExit = remaining / heldBefore <= config.alerts.fullExitResidual;
-  return { isNewPosition: false, isFullExit, costBasisUsd, realizedPnlUsd, realizedPnlPct };
-}

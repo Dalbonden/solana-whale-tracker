@@ -28,6 +28,9 @@ const compile = spawnSync(
     tsc,
     'src/lib/solana/parse.ts',
     'src/lib/solana/constants.ts',
+    'src/lib/core/positions.ts',
+    '--rootDir',
+    'src/lib',
     '--outDir',
     '.test-build',
     '--module',
@@ -56,7 +59,7 @@ if (fatal.length) {
   process.exit(1);
 }
 
-if (!existsSync(join(outDir, 'parse.js'))) {
+if (!existsSync(join(outDir, 'solana', 'parse.js'))) {
   console.error('Compilation produced no output; cannot run tests.');
   process.exit(1);
 }

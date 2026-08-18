@@ -12,6 +12,7 @@ import type {
   PortfolioHolding,
   TokenLeaderboardRow,
   Whale,
+  WhalePosition,
   WhaleTrade,
 } from '@/types';
 
@@ -362,6 +363,152 @@ export async function getRecentExits(
     .order('block_time', { ascending: false });
   if (error) throw new Error(`getRecentExits: ${error.message}`);
   return (data ?? []) as Array<{ token_mint: string; token_symbol: string | null; block_time: string }>;
+}
+
+// ---------------------------------------------------------------------------
+// Positions
+// ---------------------------------------------------------------------------
+
+/** Composite identity of a trade leg, matching whale_trades_unique_leg. */
+export function tradeKey(t: {
+  signature: string;
+  whale_address: string;
+  token_mint: string;
+  side: string;
+}): string {
+  return `${t.signature}:${t.whale_address}:${t.token_mint}:${t.side}`;
+}
+
+/**
+ * Drops trades already stored, before they reach the position state machine.
+ *
+ * `insertTrades` deduplicates too, but it does so *after* classification. That
+ * is too late for positions: a replayed webhook would apply the same buy to the
+ * position twice, and every later trade in the batch would be classified
+ * against an inflated balance. Filtering first makes the ingest path idempotent
+ * in the arithmetic, not just in the row count.
+ */
+export async function filterNewTrades<T extends Partial<WhaleTrade>>(rows: T[]): Promise<T[]> {
+  if (!rows.length) return [];
+
+  const signatures = [...new Set(rows.map((r) => r.signature as string))];
+  const seen = new Set<string>();
+
+  for (const batch of chunk(signatures, 200)) {
+    const { data, error } = await db()
+      .from('whale_trades')
+      .select('signature, whale_address, token_mint, side')
+      .in('signature', batch);
+    if (error) throw new Error(`filterNewTrades: ${error.message}`);
+    for (const row of data ?? []) {
+      seen.add(tradeKey(row as Parameters<typeof tradeKey>[0]));
+    }
+  }
+
+  return rows.filter((row) => !seen.has(tradeKey(row as Parameters<typeof tradeKey>[0])));
+}
+
+/** Open cycles for a set of whale/token pairs, keyed `whale:mint`. */
+export async function getOpenPositions(
+  pairs: Array<{ whale: string; mint: string }>
+): Promise<Map<string, WhalePosition>> {
+  const found = new Map<string, WhalePosition>();
+  if (!pairs.length) return found;
+
+  const whales = [...new Set(pairs.map((p) => p.whale))];
+  const mints = [...new Set(pairs.map((p) => p.mint))];
+
+  // Fetched as a cross-product of the batch's whales and mints, then narrowed
+  // in memory. One round trip beats one query per pair, and the open-position
+  // set per whale is small.
+  for (const batch of chunk(whales, 50)) {
+    const { data, error } = await db()
+      .from('whale_positions')
+      .select('*')
+      .in('whale_address', batch)
+      .in('token_mint', mints)
+      .eq('status', 'open');
+    if (error) throw new Error(`getOpenPositions: ${error.message}`);
+    for (const row of (data ?? []) as WhalePosition[]) {
+      found.set(`${row.whale_address}:${row.token_mint}`, row);
+    }
+  }
+
+  return found;
+}
+
+export async function upsertPositions(rows: Partial<WhalePosition>[]): Promise<number> {
+  if (!rows.length) return 0;
+  let written = 0;
+  for (const batch of chunk(rows, 200)) {
+    const { error } = await db()
+      .from('whale_positions')
+      .upsert(batch, { onConflict: 'whale_address,token_mint,opened_by_signature' });
+    if (error) throw new Error(`upsertPositions: ${error.message}`);
+    written += batch.length;
+  }
+  return written;
+}
+
+export async function listPositions(
+  whale: string,
+  opts: { status?: 'open' | 'closed' } = {}
+): Promise<WhalePosition[]> {
+  let query = db().from('whale_positions').select('*').eq('whale_address', whale);
+  if (opts.status) query = query.eq('status', opts.status);
+
+  const { data, error } = await query
+    .order('status', { ascending: true })
+    .order('last_trade_at', { ascending: false });
+  if (error) throw new Error(`listPositions: ${error.message}`);
+  return (data ?? []) as WhalePosition[];
+}
+
+/** Cached prices for a set of mints, for marking positions to market. */
+export async function getTokenPrices(mints: string[]): Promise<Map<string, number | null>> {
+  const prices = new Map<string, number | null>();
+  if (!mints.length) return prices;
+
+  for (const batch of chunk([...new Set(mints)], 200)) {
+    const { data, error } = await db()
+      .from('meme_tokens')
+      .select('mint, price_usd')
+      .in('mint', batch);
+    if (error) throw new Error(`getTokenPrices: ${error.message}`);
+    for (const row of data ?? []) {
+      prices.set(row.mint as string, row.price_usd === null ? null : Number(row.price_usd));
+    }
+  }
+
+  return prices;
+}
+
+/** Every stored trade for a whale, oldest first — the rebuild job's input. */
+export async function getAllTradesForWhale(whale: string): Promise<WhaleTrade[]> {
+  const rows: WhaleTrade[] = [];
+  const pageSize = 1000;
+
+  for (let from = 0; ; from += pageSize) {
+    const { data, error } = await db()
+      .from('whale_trades')
+      .select('*')
+      .eq('whale_address', whale)
+      .order('block_time', { ascending: true })
+      .order('signature', { ascending: true })
+      .range(from, from + pageSize - 1);
+    if (error) throw new Error(`getAllTradesForWhale: ${error.message}`);
+
+    rows.push(...((data ?? []) as WhaleTrade[]));
+    if (!data || data.length < pageSize) break;
+  }
+
+  return rows;
+}
+
+/** Clears a whale's positions so a rebuild is a replacement, not a merge. */
+export async function deletePositionsForWhale(whale: string): Promise<void> {
+  const { error } = await db().from('whale_positions').delete().eq('whale_address', whale);
+  if (error) throw new Error(`deletePositionsForWhale: ${error.message}`);
 }
 
 // ---------------------------------------------------------------------------

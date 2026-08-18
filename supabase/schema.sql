@@ -141,6 +141,60 @@ create index if not exists whale_portfolios_lookup_idx on public.whale_portfolio
 create index if not exists whale_portfolios_token_idx  on public.whale_portfolios (token_mint, snapshot_at desc);
 
 -- ---------------------------------------------------------------------------
+-- whale_positions — position lifecycle, one row per entry→exit cycle.
+--
+-- whale_portfolios answers "what do they hold right now". This answers "what
+-- did this position cost, how long have they held it, and are they up on it" —
+-- which needs the cycle, not the snapshot.
+--
+-- A re-entry after a full exit opens a NEW row rather than reviving the old
+-- one, so hold duration and per-cycle P&L stay meaningful. `opened_at` is part
+-- of the key for exactly that reason.
+-- ---------------------------------------------------------------------------
+create table if not exists public.whale_positions (
+  id                uuid primary key default gen_random_uuid(),
+  whale_address     text not null references public.whales(address) on delete cascade,
+  token_mint        text not null,
+  token_symbol      text,
+  -- The cycle's identity. `opened_at` alone is not unique: Solana packs many
+  -- swaps into one second, so the sell that closes a cycle and the buy that
+  -- opens the next routinely carry the same timestamp.
+  opened_by_signature text not null,
+  status            text not null default 'open' check (status in ('open','closed')),
+
+  amount            numeric(38,12) not null default 0,   -- units still held
+  cost_basis_usd    numeric(24,2)  not null default 0,   -- basis of the remaining units
+  avg_entry_price   numeric(24,12),
+
+  total_bought_usd  numeric(24,2) not null default 0,
+  total_sold_usd    numeric(24,2) not null default 0,
+  realized_pnl_usd  numeric(24,2) not null default 0,
+  buy_count         integer not null default 0,
+  sell_count        integer not null default 0,
+
+  -- False when the first activity we saw was a sell: the entry predates
+  -- tracking, so basis and therefore P&L are unknowable. Never guessed.
+  basis_complete    boolean not null default true,
+
+  opened_at         timestamptz not null,
+  closed_at         timestamptz,
+  last_trade_at     timestamptz not null,
+  updated_at        timestamptz not null default now(),
+
+  constraint whale_positions_unique unique (whale_address, token_mint, opened_by_signature)
+);
+
+create index if not exists whale_positions_whale_idx  on public.whale_positions (whale_address, status);
+create index if not exists whale_positions_token_idx  on public.whale_positions (token_mint, status);
+create index if not exists whale_positions_recent_idx on public.whale_positions (status, last_trade_at desc);
+
+-- The ingest path reads exactly one row per trade: the open cycle for this
+-- whale/token. Partial index keeps that lookup on the open set only.
+create index if not exists whale_positions_open_idx
+  on public.whale_positions (whale_address, token_mint)
+  where status = 'open';
+
+-- ---------------------------------------------------------------------------
 -- alerts — derived signals. Append-only.
 -- ---------------------------------------------------------------------------
 create table if not exists public.alerts (
@@ -262,6 +316,7 @@ alter table public.meme_tokens      enable row level security;
 alter table public.whales           enable row level security;
 alter table public.whale_trades     enable row level security;
 alter table public.whale_portfolios enable row level security;
+alter table public.whale_positions  enable row level security;
 alter table public.alerts           enable row level security;
 alter table public.job_runs         enable row level security;
 
@@ -284,6 +339,9 @@ language sql
 as $$
   delete from public.whale_trades     where block_time  < now() - (days || ' days')::interval;
   delete from public.whale_portfolios where snapshot_at < now() - (days || ' days')::interval;
+  -- Closed cycles only. Open positions are current state, never history.
+  delete from public.whale_positions  where status = 'closed'
+                                        and closed_at  < now() - (days || ' days')::interval;
   delete from public.alerts           where created_at  < now() - (days || ' days')::interval;
   delete from public.job_runs         where created_at  < now() - interval '14 days';
 $$;

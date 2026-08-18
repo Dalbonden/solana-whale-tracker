@@ -14,9 +14,12 @@
 
 import { config } from '@/lib/config';
 import {
+  filterNewTrades,
+  getOpenPositions,
   getToken,
   insertTrades,
   markWhaleSynced,
+  upsertPositions,
   upsertWhales,
 } from '@/lib/db/repositories';
 import * as birdeye from '@/lib/providers/birdeye';
@@ -31,8 +34,9 @@ import {
 } from '@/lib/solana/parse';
 import type { ParsedSwap, Whale, WhaleTrade } from '@/types';
 
-import { classifyPosition, generateAlerts } from './alerts';
+import { generateAlerts } from './alerts';
 import { createMemeFilter } from './meme-filter';
+import { applyTrade, stateFromRow, stateToRow, type PositionState } from './positions';
 
 export interface IngestResult {
   parsed: number;
@@ -61,6 +65,19 @@ async function symbolFor(mint: string): Promise<string | null> {
 /**
  * Prices, classifies and stores a batch of parsed swaps, then runs the alert
  * rules over whatever was genuinely new.
+ *
+ * Runs in two phases against the position ledger:
+ *
+ *   1. Drop trades already stored, *before* any position arithmetic. The webhook
+ *      and the polling cron deliberately overlap, so the same swap arrives
+ *      twice routinely. Deduplicating only at insert time would be too late —
+ *      the position would already have absorbed the buy twice, and every later
+ *      trade in the batch would be classified against an inflated balance.
+ *   2. Replay the survivors through the position state machine in chronological
+ *      order, then persist trades and positions together.
+ *
+ * This replaces a per-trade replay of the whale's entire history, which was
+ * O(history) on the webhook hot path and grew with every trade ingested.
  */
 export async function persistSwaps(swaps: ParsedSwap[]): Promise<IngestResult> {
   if (!swaps.length) {
@@ -68,22 +85,69 @@ export async function persistSwaps(swaps: ParsedSwap[]): Promise<IngestResult> {
   }
 
   const prices = await birdeye.getPrices(mintsToPrice(swaps));
-  const rows: Partial<WhaleTrade>[] = [];
 
-  // Sequential on purpose: `classifyPosition` reads the position built by the
-  // trades before it, so processing in chronological order is what makes the
-  // new-position / full-exit flags correct.
+  // Chronological order is what makes the new-position / full-exit flags
+  // correct: each trade is classified against the position the earlier ones
+  // built.
   const ordered = [...swaps].sort((a, b) => a.blockTime.getTime() - b.blockTime.getTime());
 
-  for (const swap of ordered) {
-    const { usdValue, priceUsd } = valueSwapUsd(swap, prices);
-    const position = await classifyPosition(
-      swap.wallet,
-      swap.tokenMint,
-      swap.side,
-      swap.tokenAmount,
-      usdValue
+  const priced = ordered.map((swap) => ({ swap, ...valueSwapUsd(swap, prices) }));
+
+  // --- phase 1: drop what we already have --------------------------------
+  const candidates = priced.map(({ swap }) => ({
+    signature: swap.signature,
+    whale_address: swap.wallet,
+    token_mint: swap.tokenMint,
+    side: swap.side,
+  }));
+  const fresh = new Set(
+    (await filterNewTrades(candidates)).map(
+      (row) => `${row.signature}:${row.whale_address}:${row.token_mint}:${row.side}`
+    )
+  );
+  const incoming = priced.filter(({ swap }) =>
+    fresh.has(`${swap.signature}:${swap.wallet}:${swap.tokenMint}:${swap.side}`)
+  );
+
+  if (!incoming.length) {
+    const newest = ordered[ordered.length - 1];
+    return {
+      parsed: swaps.length,
+      stored: 0,
+      alerts: 0,
+      latestSignature: newest?.signature ?? null,
+      latestBlockTime: newest?.blockTime ?? null,
+    };
+  }
+
+  // --- phase 2: replay through the position ledger ------------------------
+  const openPositions = await getOpenPositions(
+    incoming.map(({ swap }) => ({ whale: swap.wallet, mint: swap.tokenMint }))
+  );
+
+  const states = new Map<string, PositionState>();
+  const symbols = new Map<string, string | null>();
+  const rows: Partial<WhaleTrade>[] = [];
+
+  for (const { swap, usdValue, priceUsd } of incoming) {
+    const key = `${swap.wallet}:${swap.tokenMint}`;
+    const existing = states.get(key) ?? (openPositions.has(key) ? stateFromRow(openPositions.get(key)!) : null);
+
+    const { state, classification } = applyTrade(
+      existing,
+      {
+        signature: swap.signature,
+        side: swap.side,
+        tokenAmount: swap.tokenAmount,
+        usdValue,
+        blockTime: swap.blockTime,
+      },
+      { fullExitResidual: config.alerts.fullExitResidual }
     );
+    states.set(key, state);
+
+    const symbol = await symbolFor(swap.tokenMint);
+    symbols.set(swap.tokenMint, symbol);
 
     rows.push({
       signature: swap.signature,
@@ -93,25 +157,38 @@ export async function persistSwaps(swaps: ParsedSwap[]): Promise<IngestResult> {
       side: swap.side,
       venue: swap.venue,
       token_mint: swap.tokenMint,
-      token_symbol: await symbolFor(swap.tokenMint),
+      token_symbol: symbol,
       token_amount: swap.tokenAmount,
       quote_mint: swap.quoteMint,
       quote_symbol: swap.quoteMint ? await symbolFor(swap.quoteMint) : null,
       quote_amount: swap.quoteAmount,
       usd_value: Number(usdValue.toFixed(2)),
       price_usd: priceUsd,
-      is_new_position: position.isNewPosition,
-      is_full_exit: position.isFullExit,
-      cost_basis_usd: position.costBasisUsd,
-      realized_pnl_usd: position.realizedPnlUsd,
-      realized_pnl_pct: position.realizedPnlPct,
+      is_new_position: classification.isNewPosition,
+      is_full_exit: classification.isFullExit,
+      cost_basis_usd: classification.costBasisUsd,
+      realized_pnl_usd: classification.realizedPnlUsd,
+      realized_pnl_pct: classification.realizedPnlPct,
       raw: null,
     });
   }
 
   const stored = await insertTrades(rows);
-  const alerts = stored.length ? await generateAlerts(stored) : [];
 
+  // Positions are written after the trades they summarise. A concurrent writer
+  // racing us here would leave the ledger slightly ahead of the trade table;
+  // `/api/cron/rebuild-positions` recomputes it from the trades and repairs
+  // that, which is why the rebuild is idempotent by construction.
+  const positionRows = [...states.entries()].map(([key, state]) => {
+    const [whaleAddress, tokenMint] = key.split(':');
+    return stateToRow(whaleAddress, tokenMint, symbols.get(tokenMint) ?? null, state);
+  });
+  await upsertPositions(positionRows).catch((error) => {
+    // A failed ledger write must not lose the trades that already landed.
+    console.error('[positions] upsert failed, rebuild will repair:', (error as Error).message);
+  });
+
+  const alerts = stored.length ? await generateAlerts(stored) : [];
   const newest = ordered[ordered.length - 1];
 
   return {
