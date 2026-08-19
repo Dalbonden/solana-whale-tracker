@@ -34,14 +34,20 @@ import * as helius from '@/lib/providers/helius';
 import { identifyAddress, isNonDiscretionaryHolder } from '@/lib/solana/entities';
 import { NATIVE_SOL } from '@/lib/solana/constants';
 
+import {
+  buildFundingGraph,
+  findMintCreator,
+  MAX_TRACED_CANDIDATES,
+  type DeployerLink,
+  type SharedFunderGroup,
+} from './funding-graph';
+
 /** Buys inside this window of the first trade are treated as launch snipes. */
 const SNIPE_WINDOW_SECONDS = 60;
 /** Buys this close together are treated as one synchronised cohort. */
 const CLUSTER_WINDOW_SECONDS = 3;
 /** How many opening trades to reconstruct. */
 const EARLY_TRADE_SAMPLE = 200;
-/** Deployer transactions scanned when mapping its counterparties. */
-const DEPLOYER_SCAN_TX = 200;
 
 export type SuspicionLevel = 'low' | 'medium' | 'high';
 
@@ -70,6 +76,12 @@ export interface SuspectWallet {
   pctOfSupply: number | null;
   /** Exchanged value directly with the deployer wallet. */
   linkedToDeployer: boolean;
+  /** How the wallet connects to the deployer, when it does. */
+  deployerLink: DeployerLink | null;
+  /** Wallets this one shares a funding source with. */
+  sharedFunderWith: string[];
+  /** Whether the funding walk reached this wallet's own history. */
+  fundingTraced: boolean;
   /** Id of the synchronised-buy cohort this wallet belongs to, if any. */
   clusterId: number | null;
   score: number;
@@ -94,6 +106,8 @@ export interface ForensicsReport {
   launchAt: string | null;
   deployer: {
     address: string | null;
+    /** Which source identified it, so the reader can weigh the claim. */
+    via: 'update_authority' | 'mint_creation' | null;
     note: string | null;
     /** Deployer appears among the largest holders. */
     stillHolding: boolean | null;
@@ -118,6 +132,16 @@ export interface ForensicsReport {
   };
   suspects: SuspectWallet[];
   clusters: BuyCluster[];
+  /** Funding sources shared by two or more of the traced wallets. */
+  sharedFunders: SharedFunderGroup[];
+  funding: {
+    candidatesTraced: number;
+    candidatesReachedGenesis: number;
+    tracesFailed: number;
+    deployerOutboundWallets: number;
+    hopWalletsExpanded: number;
+    requests: number;
+  };
   summary: string[];
   /** What could not be determined, stated plainly rather than left implied. */
   limitations: string[];
@@ -128,51 +152,6 @@ function levelFor(score: number): SuspicionLevel {
   if (score >= 60) return 'high';
   if (score >= 30) return 'medium';
   return 'low';
-}
-
-/**
- * Wallets that transacted value directly with the deployer.
- *
- * Scans the deployer's own history once rather than each candidate's, which
- * turns an unbounded per-wallet crawl into a couple of calls. It finds direct
- * links only — a wallet funded through one hop will not appear, and the report
- * says so rather than implying the absence of a link means independence.
- */
-async function deployerCounterparties(deployer: string): Promise<Set<string>> {
-  const counterparties = new Set<string>();
-
-  const transactions = await helius
-    .getEnhancedHistory(deployer, { limit: 100 })
-    .catch(() => []);
-
-  let scanned = transactions;
-  if (transactions.length === 100) {
-    const more = await helius
-      .getEnhancedHistory(deployer, { limit: 100, before: transactions[99]?.signature })
-      .catch(() => []);
-    scanned = [...transactions, ...more];
-  }
-
-  for (const tx of scanned.slice(0, DEPLOYER_SCAN_TX)) {
-    for (const transfer of tx.nativeTransfers ?? []) {
-      if (transfer.fromUserAccount && transfer.fromUserAccount !== deployer) {
-        counterparties.add(transfer.fromUserAccount);
-      }
-      if (transfer.toUserAccount && transfer.toUserAccount !== deployer) {
-        counterparties.add(transfer.toUserAccount);
-      }
-    }
-    for (const transfer of tx.tokenTransfers ?? []) {
-      if (transfer.fromUserAccount && transfer.fromUserAccount !== deployer) {
-        counterparties.add(transfer.fromUserAccount);
-      }
-      if (transfer.toUserAccount && transfer.toUserAccount !== deployer) {
-        counterparties.add(transfer.toUserAccount);
-      }
-    }
-  }
-
-  return counterparties;
 }
 
 export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
@@ -191,6 +170,7 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
     launchAt: null,
     deployer: {
       address: null,
+      via: null,
       note: null,
       stillHolding: null,
       pctOfSupply: null,
@@ -203,6 +183,15 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
     launchProfile: { sniperCount: 0, sniperRatio: 0, speedDiscount: 1, botSwarm: false },
     suspects: [],
     clusters: [],
+    sharedFunders: [],
+    funding: {
+      candidatesTraced: 0,
+      candidatesReachedGenesis: 0,
+      tracesFailed: 0,
+      deployerOutboundWallets: 0,
+      hopWalletsExpanded: 0,
+      requests: 0,
+    },
     summary: [],
     limitations,
   };
@@ -218,16 +207,39 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
   // platform, not the person who made this token. Naming it as the creator
   // would tag one address as the deployer of thousands of unrelated tokens.
   const authorityEntity = updateAuthority ? identifyAddress(updateAuthority) : null;
-  const deployer =
+  let deployer =
     updateAuthority && authorityEntity && authorityEntity.kind === 'unidentified'
       ? updateAuthority
       : null;
+  let deployerVia: 'update_authority' | 'mint_creation' | null = deployer
+    ? 'update_authority'
+    : null;
+
+  // Metadata is a dead end on launchpad tokens, which are most of what anyone
+  // wants analysed. Fall back to whoever paid to create the mint.
+  if (!deployer) {
+    const creatorCounter = { requests: 0, failures: 0 };
+    const creator = await findMintCreator(mint, creatorCounter).catch(() => ({
+      address: null,
+      via: null as null,
+    }));
+    if (creator.address) {
+      deployer = creator.address;
+      deployerVia = 'mint_creation';
+    }
+  }
+
+  report.deployer.via = deployerVia;
 
   if (!deployer) {
     report.deployer.note = updateAuthority
-      ? `Update authority is ${authorityEntity?.label ?? 'a known program'}, which is shared across every token from that platform — the individual deployer is not recoverable from it.`
-      : 'No update authority is set, so the deployer cannot be identified from metadata.';
+      ? `Update authority is ${authorityEntity?.label ?? 'a known program'}, which is shared across every token from that platform, and the mint's creation transaction was not reachable within the page budget — so the individual deployer could not be identified.`
+      : 'No update authority is set and the mint creation transaction was not reachable, so the deployer could not be identified.';
     limitations.push('Deployer wallet could not be identified, so deployer links were not checked.');
+  } else if (deployerVia === 'mint_creation') {
+    limitations.push(
+      'The deployer was identified as the wallet that paid to create the mint. That is who funded the creation, which is usually but not always the same person as the operator.'
+    );
   }
 
   const launchUnix = trades[0].blockUnixTime;
@@ -248,9 +260,6 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
     report.deployer.stillHolding = holders.length ? holderShare.has(deployer) : null;
     report.deployer.pctOfSupply = holderShare.get(deployer) ?? null;
   }
-
-  const counterparties = deployer ? await deployerCounterparties(deployer) : new Set<string>();
-  report.deployer.counterpartiesScanned = counterparties.size;
 
   // --- aggregate the opening trades per wallet -----------------------------
   interface Acc {
@@ -314,7 +323,7 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
         atSecondsAfterLaunch: current[0][1].firstBuyUnix - launchUnix,
         combinedTokens: combined,
         combinedShareOfEarlyVolume: earlyVolume > 0 ? combined / earlyVolume : 0,
-        membersLinkedToDeployer: current.filter(([address]) => counterparties.has(address)).length,
+        membersLinkedToDeployer: 0, // filled once the funding graph is built
       });
     }
     current = [];
@@ -360,8 +369,22 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
 
   const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
 
-  // --- score ---------------------------------------------------------------
-  const suspects: SuspectWallet[] = buyers.map(([address, acc]) => {
+  /*
+   * Scoring runs in two phases. Tracing a wallet's funding costs several
+   * requests, so it is only worth spending on wallets that already look
+   * notable — the opening book of a launch runs to hundreds of dust bots.
+   * Phase one scores everything on trade behaviour alone and ranks it; phase
+   * two traces the top of that list and folds the funding evidence back in.
+   */
+  const scoreOne = (
+    address: string,
+    acc: Acc,
+    funding: {
+      link: DeployerLink | null;
+      sharedWith: string[];
+      traced: boolean;
+    }
+  ): SuspectWallet => {
     const secondsAfterLaunch = acc.firstBuyUnix - launchUnix;
     const share = earlyVolume > 0 ? acc.tokensBought / earlyVolume : 0;
     const signals: ForensicSignal[] = [];
@@ -393,7 +416,14 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
       score += weight;
     }
 
-    if (share >= 0.20) {
+    if (share >= 0.50) {
+      signals.push({
+        code: 'majority_of_book',
+        detail: `Took ${(share * 100).toFixed(1)}% of all tokens bought across the sampled opening trades. One wallet accounting for most of the opening book means the early market was effectively this wallet.`,
+        weight: 45,
+      });
+      score += 45;
+    } else if (share >= 0.20) {
       signals.push({
         code: 'dominant_size',
         detail: `Took ${(share * 100).toFixed(1)}% of all tokens bought across the sampled opening trades — a dominant share of the opening book regardless of timing.`,
@@ -416,15 +446,29 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
       score += 10;
     }
 
-    const linkedToDeployer = counterparties.has(address);
-    if (linkedToDeployer) {
+    const link = funding.link;
+    const linkedToDeployer = link !== null;
+    if (link) {
+      const weight = link.kind === 'direct' ? 35 : 25;
+      const amount = link.sol !== null ? ` (${link.sol.toFixed(2)} SOL on the smallest leg)` : '';
       signals.push({
-        code: 'deployer_link',
+        code: link.kind === 'direct' ? 'deployer_link' : 'deployer_link_indirect',
         detail:
-          'Exchanged SOL or tokens directly with the deployer wallet. Direct transfer only — this does not establish who controls either wallet.',
-        weight: 30,
+          link.kind === 'direct'
+            ? `Funded by the deployer wallet directly${amount}. A transfer only — it does not establish who controls either wallet.`
+            : `Funded through ${link.path[1].slice(0, 4)}…${link.path[1].slice(-4)}, a wallet the deployer also funded${amount}. Two hops, so the connection is weaker than a direct transfer.`,
+        weight,
       });
-      score += 30;
+      score += weight;
+    }
+
+    if (funding.sharedWith.length) {
+      signals.push({
+        code: 'shared_funder',
+        detail: `Shares a funding source with ${funding.sharedWith.length} other wallet${funding.sharedWith.length === 1 ? '' : 's'} in this launch. Exchange withdrawals are excluded from this signal.`,
+        weight: 20,
+      });
+      score += 20;
     }
 
     const clusterId = clusterOf.get(address) ?? null;
@@ -473,6 +517,9 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
 
     return {
       address,
+      deployerLink: link,
+      sharedFunderWith: funding.sharedWith,
+      fundingTraced: funding.traced,
       secondsAfterLaunch,
       firstBuyAt: new Date(acc.firstBuyUnix * 1000).toISOString(),
       tokensBought: acc.tokensBought,
@@ -488,11 +535,62 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
       level: levelFor(finalScore),
       signals,
     };
+  };
+
+  const noFunding = { link: null, sharedWith: [] as string[], traced: false };
+
+  // Phase one: behaviour only.
+  const preliminary = buyers
+    .map(([address, acc]) => ({ address, acc, scored: scoreOne(address, acc, noFunding) }))
+    .sort(
+      (a, b) =>
+        b.scored.score - a.scored.score ||
+        b.scored.shareOfEarlyVolume - a.scored.shareOfEarlyVolume
+    );
+
+  // Phase two: trace the funding of the wallets that already stand out.
+  const graph = await buildFundingGraph({
+    deployer,
+    candidates: preliminary.slice(0, MAX_TRACED_CANDIDATES).map((entry) => entry.address),
+    allBuyers: preliminary.map((entry) => entry.address),
   });
 
+  const linkByCandidate = new Map(graph.links.map((link) => [link.candidate, link]));
+  const sharedByCandidate = new Map<string, string[]>();
+  for (const group of graph.sharedFunders) {
+    // A shared exchange hot wallet groups thousands of unrelated people, so it
+    // is reported for context but never scored as a connection.
+    if (group.likelyService) continue;
+    for (const member of group.members) {
+      sharedByCandidate.set(member, [
+        ...(sharedByCandidate.get(member) ?? []),
+        ...group.members.filter((m) => m !== member),
+      ]);
+    }
+  }
+
+  const suspects = preliminary.map((entry) =>
+    scoreOne(entry.address, entry.acc, {
+      link: linkByCandidate.get(entry.address) ?? null,
+      sharedWith: [...new Set(sharedByCandidate.get(entry.address) ?? [])],
+      traced: graph.traces.has(entry.address),
+    })
+  );
+
   suspects.sort((a, b) => b.score - a.score || a.secondsAfterLaunch - b.secondsAfterLaunch);
+
+  // Now that links are known, cohorts can report how many members carry one.
+  const linkedSet = new Set(graph.links.map((link) => link.candidate));
+  for (const cluster of clusters) {
+    cluster.membersLinkedToDeployer = cluster.members.filter((m) => linkedSet.has(m)).length;
+  }
+
   report.suspects = suspects.slice(0, 25);
   report.clusters = clusters;
+  report.sharedFunders = graph.sharedFunders;
+  report.funding = graph.stats;
+  report.deployer.counterpartiesScanned = graph.stats.deployerOutboundWallets;
+  limitations.push(...graph.notes);
 
   // --- summary -------------------------------------------------------------
   const high = suspects.filter((s) => s.level === 'high');
@@ -514,8 +612,27 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
     );
   }
   if (linked.length) {
+    const direct = linked.filter((l) => l.deployerLink?.kind === 'direct').length;
+    const indirect = linked.length - direct;
     report.summary.push(
-      `${linked.length} of them transacted directly with the deployer wallet at some point.`
+      `Funding traces back to the deployer for ${linked.length} of the wallets examined` +
+        (indirect
+          ? ` — ${direct} funded directly, ${indirect} through an intermediary wallet the deployer also funded.`
+          : ', by direct transfer.')
+    );
+  }
+
+  const realGroups = report.sharedFunders.filter((g) => !g.likelyService);
+  if (realGroups.length) {
+    const grouped = new Set(realGroups.flatMap((g) => g.members)).size;
+    report.summary.push(
+      `${grouped} wallets were funded from ${realGroups.length} shared source${realGroups.length === 1 ? '' : 's'} that do not look like exchanges — the clearest sign in this report that separate wallets were not independently funded.`
+    );
+  }
+  const serviceGroups = report.sharedFunders.length - realGroups.length;
+  if (serviceGroups > 0) {
+    report.summary.push(
+      `${serviceGroups} further shared funding source${serviceGroups === 1 ? '' : 's'} were excluded as exchange or bot infrastructure, which thousands of unrelated wallets share.`
     );
   }
   if (clusters.length) {
@@ -536,15 +653,15 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
     `Analysis covers the first ${trades.length} recorded trades only; activity after that window is not considered.`
   );
   limitations.push(
-    'Deployer links are direct transfers only. Funding routed through an intermediary wallet or an exchange will not appear, so an absent link is not evidence of independence.'
+    `Funding was traced for the ${report.funding.candidatesTraced} highest-ranked wallets only, two hops from the deployer at most. A wallet further down the list, or connected through a longer chain, would not show a link — an absent link is not evidence of independence.`
   );
   if (deployer) {
     const ageDays = (Date.now() / 1000 - launchUnix) / 86_400;
-    limitations.push(
-      ageDays > 30
-        ? `Deployer counterparties come from that wallet's ${DEPLOYER_SCAN_TX} most recent transactions, but this token launched ${Math.round(ageDays)} days ago. Transfers made around the launch itself are outside that window, so deployer links are likely undercounted here.`
-        : `Deployer counterparties come from that wallet's ${DEPLOYER_SCAN_TX} most recent transactions, which for a token this recent covers the launch period.`
-    );
+    if (ageDays > 30) {
+      limitations.push(
+        `This token launched ${Math.round(ageDays)} days ago. The deployer-side walk covers that wallet's recent transactions, so transfers made around the launch itself may fall outside it; the candidate-side walk compensates only as far as each wallet's own history budget reaches.`
+      );
+    }
   }
   limitations.push(
     'Wallets are not identities. One person may run many wallets, and one wallet may be a shared or custodial account.'

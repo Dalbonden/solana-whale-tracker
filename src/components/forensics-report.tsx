@@ -9,6 +9,7 @@ import {
   ShieldCheck,
   Timer,
   Users,
+  Wallet,
 } from 'lucide-react';
 import Link from 'next/link';
 import { useState } from 'react';
@@ -29,6 +30,21 @@ interface Signal {
   weight: number;
 }
 
+interface DeployerLink {
+  candidate: string;
+  kind: 'direct' | 'one_hop' | 'funded_by_deployer_peer';
+  path: string[];
+  sol: number | null;
+}
+
+interface SharedFunder {
+  funder: string;
+  members: string[];
+  totalSol: number;
+  likelyService: boolean;
+  label: string | null;
+}
+
 interface Suspect {
   address: string;
   secondsAfterLaunch: number;
@@ -41,6 +57,9 @@ interface Suspect {
   stillHolding: boolean | null;
   pctOfSupply: number | null;
   linkedToDeployer: boolean;
+  deployerLink: DeployerLink | null;
+  sharedFunderWith: string[];
+  fundingTraced: boolean;
   clusterId: number | null;
   score: number;
   level: Level;
@@ -62,6 +81,7 @@ interface Report {
   launchAt: string | null;
   deployer: {
     address: string | null;
+    via: 'update_authority' | 'mint_creation' | null;
     note: string | null;
     stillHolding: boolean | null;
     pctOfSupply: number | null;
@@ -73,6 +93,15 @@ interface Report {
   distinctEarlyBuyers: number;
   suspects: Suspect[];
   clusters: Cluster[];
+  sharedFunders: SharedFunder[];
+  funding: {
+    candidatesTraced: number;
+    candidatesReachedGenesis: number;
+    tracesFailed: number;
+    deployerOutboundWallets: number;
+    hopWalletsExpanded: number;
+    requests: number;
+  };
   summary: string[];
   limitations: string[];
   error?: string;
@@ -202,6 +231,11 @@ function Result({ report }: { report: Report }) {
             <Metric label="Trades sampled" value={String(report.earlyTradesSampled)} />
             <Metric label="Early buyers" value={String(report.distinctEarlyBuyers)} />
             <Metric label="Cohorts" value={String(report.clusters.length)} />
+            <Metric label="Funding traced" value={`${report.funding.candidatesTraced} wallets`} />
+            <Metric
+              label="Origin confirmed"
+              value={`${report.funding.candidatesReachedGenesis}/${report.funding.candidatesTraced}`}
+            />
           </div>
 
           <ul className="space-y-1.5">
@@ -261,8 +295,15 @@ function Result({ report }: { report: Report }) {
                   : 'Not among the largest holders — the wallet may have distributed or sold down.'}
               </p>
               <p className="text-muted-foreground">
-                {report.deployer.counterpartiesScanned} direct counterparties found while scanning
-                this wallet&apos;s recent transactions.
+                Funded {report.deployer.counterpartiesScanned} wallets in the history scanned;{' '}
+                {report.funding.hopWalletsExpanded} of those were followed one hop further.
+              </p>
+              <p className="text-muted-foreground">
+                Identified from{' '}
+                {report.deployer.via === 'mint_creation'
+                  ? 'the wallet that paid to create the mint'
+                  : 'the token metadata update authority'}
+                .
               </p>
             </div>
           ) : (
@@ -337,6 +378,69 @@ function Result({ report }: { report: Report }) {
         </section>
       )}
 
+      {/* --- shared funders ----------------------------------------------- */}
+      {report.sharedFunders.length > 0 && (
+        <section className="space-y-3">
+          <h2 className="flex items-center gap-1.5 text-sm font-semibold">
+            <Wallet className="h-3.5 w-3.5" /> Shared funding sources
+          </h2>
+          <p className="text-[11px] text-muted-foreground">
+            Wallets that received their earliest SOL from the same address. Exchange hot wallets are
+            shared by thousands of unrelated people, so those are identified by transaction velocity
+            and shown greyed out. They are context, not evidence.
+          </p>
+          <div className="space-y-2">
+            {report.sharedFunders.map((g) => (
+              <div
+                key={g.funder}
+                className={cn(
+                  'rounded-md border p-3 text-xs',
+                  g.likelyService ? 'border-border opacity-60' : 'border-rose-500/30 bg-rose-500/5'
+                )}
+              >
+                <div className="mb-1.5 flex flex-wrap items-center gap-2">
+                  <a
+                    href={EXPLORERS.account(g.funder)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 font-mono hover:text-primary"
+                  >
+                    {shortenAddress(g.funder, 5)}
+                    <ExternalLink className="h-3 w-3 opacity-60" />
+                  </a>
+                  <Badge variant={g.likelyService ? 'outline' : 'bear'} className="text-[9px]">
+                    {g.likelyService
+                      ? 'likely exchange or bot'
+                      : `funded ${g.members.length} wallets here`}
+                  </Badge>
+                  {g.label && (
+                    <Badge variant="outline" className="text-[9px]">
+                      {g.label}
+                    </Badge>
+                  )}
+                  <span className="tabular ml-auto text-muted-foreground">
+                    {g.totalSol.toFixed(2)} SOL
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {g.members.map((m) => (
+                    <a
+                      key={m}
+                      href={EXPLORERS.account(m)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] hover:text-primary"
+                    >
+                      {shortenAddress(m, 3)}
+                    </a>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       {/* --- limitations -------------------------------------------------- */}
       <Card>
         <CardHeader>
@@ -384,9 +488,17 @@ function SuspectRow({ suspect, rank }: { suspect: Suspect; rank: number }) {
             <Badge variant="outline" className="text-[9px] capitalize">
               {suspect.level}
             </Badge>
-            {suspect.linkedToDeployer && (
+            {suspect.deployerLink && (
               <Badge variant="bear" className="gap-1 text-[9px]">
-                <Link2 className="h-2.5 w-2.5" /> deployer transfer
+                <Link2 className="h-2.5 w-2.5" />
+                {suspect.deployerLink.kind === 'direct'
+                  ? 'deployer funded'
+                  : 'deployer funded, 2 hops'}
+              </Badge>
+            )}
+            {suspect.sharedFunderWith.length > 0 && (
+              <Badge variant="secondary" className="gap-1 text-[9px]">
+                <Wallet className="h-2.5 w-2.5" /> shared funder
               </Badge>
             )}
             {suspect.clusterId !== null && (
@@ -432,6 +544,30 @@ function SuspectRow({ suspect, rank }: { suspect: Suspect; rank: number }) {
               </li>
             )}
           </ul>
+          {suspect.deployerLink && (
+            <div className="rounded-md border border-rose-500/25 bg-rose-500/5 p-2">
+              <p className="mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">
+                Funding path
+              </p>
+              <div className="flex flex-wrap items-center gap-1 font-mono text-[10px]">
+                {suspect.deployerLink.path.map((hop, i) => (
+                  <span key={hop} className="flex items-center gap-1">
+                    {i > 0 && <span className="text-muted-foreground">&rarr;</span>}
+                    <a
+                      href={EXPLORERS.account(hop)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="rounded bg-muted px-1.5 py-0.5 hover:text-primary"
+                      title={hop}
+                    >
+                      {i === 0 ? 'deployer' : shortenAddress(hop, 3)}
+                    </a>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
           <div className="flex flex-wrap gap-3 pt-1 text-[11px]">
             <a
               href={EXPLORERS.account(suspect.address)}
@@ -450,6 +586,9 @@ function SuspectRow({ suspect, rank }: { suspect: Suspect; rank: number }) {
             <span className="text-muted-foreground">
               {suspect.buyCount} buys · {suspect.sellCount} sells in sample
             </span>
+            {!suspect.fundingTraced && (
+              <span className="text-muted-foreground">funding not traced (outside budget)</span>
+            )}
           </div>
         </div>
       )}
