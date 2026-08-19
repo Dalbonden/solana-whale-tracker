@@ -37,27 +37,48 @@ export async function GET(request: Request) {
     const counter = newCounter();
     let confirmed = 0;
     let failed = 0;
+    let walked = 0;
     const errors: Array<{ address: string; error: string }> = [];
+
+    /*
+     * Stop before the platform kills us. Walking serially costs roughly a
+     * second per page, so `limit` × `pages` can easily exceed the function
+     * timeout — and a run terminated mid-flight loses the summary that tells
+     * the operator what happened. Progress itself is safe either way, since
+     * each wallet's cursor is committed as it completes, but exiting cleanly
+     * means the next run starts from a known state.
+     */
+    const deadline = Date.now() + 240_000;
+    let stoppedEarly = false;
 
     // Serial: the point is depth over time, not speed, and Helius rate-limits
     // parallel history walks on the free tier.
     for (const trace of pending) {
+      if (Date.now() > deadline) {
+        stoppedEarly = true;
+        break;
+      }
       try {
-        const walked = await extendTrace(trace, trace.pagesWalked + pages, counter);
-        if (walked.originConfirmed) confirmed += 1;
-        if (walked.lastWalkFailed) failed += 1;
+        const result = await extendTrace(trace, trace.pagesWalked + pages, counter);
+        walked += 1;
+        if (result.originConfirmed) confirmed += 1;
+        if (result.lastWalkFailed) failed += 1;
       } catch (error) {
         errors.push({ address: trace.address, error: (error as Error).message });
       }
     }
 
     return {
-      processed: pending.length,
+      processed: walked,
       created: confirmed,
       originsConfirmed: confirmed,
       walksRateLimited: failed,
       requests: counter.requests,
       cacheAvailable: counter.cacheAvailable,
+      // Remaining wallets are simply picked up next run: the queue is ordered
+      // by least-recently-walked, so nothing is starved.
+      stoppedEarly,
+      skipped: stoppedEarly ? pending.length - walked : 0,
       errors: errors.slice(0, 10),
     };
   });
