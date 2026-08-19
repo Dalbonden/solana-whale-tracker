@@ -28,33 +28,41 @@
  * quietly presented as absence. A wallet whose history we could not reach is
  * "not traced", never "independent".
  *
+ * The cap is per *visit*, not per wallet. `trace-store` remembers each wallet's
+ * paging cursor, so a wallet seen at three launches has been walked three times
+ * as deep as one seen once — and sniper wallets recur constantly, so the
+ * wallets that matter deepen fastest.
+ *
  * WHY SHARED FUNDERS ARE MOSTLY BORING
  *
  * The majority of wallets are funded by an exchange. Thousands of unrelated
  * people withdraw from the same hot wallet, so "shared funder" on its own means
  * almost nothing. Rather than guess at a list of exchange addresses — and
  * mislabel a real wallet as infrastructure — service wallets are detected
- * structurally, from transaction velocity: an address pushing a hundred
- * transactions in minutes is not a person.
+ * structurally, from transaction velocity.
  */
 
-import * as helius from '@/lib/providers/helius';
-import type { HeliusEnhancedTransaction } from '@/lib/providers/helius';
-import { identifyAddress, isNonDiscretionaryHolder } from '@/lib/solana/entities';
 import { mapWithConcurrency } from '@/lib/providers/http';
+import { identifyAddress, isNonDiscretionaryHolder } from '@/lib/solana/entities';
 
-const LAMPORTS_PER_SOL = 1_000_000_000;
+import {
+  ensureTrace,
+  extendTrace,
+  loadTraces,
+  newCounter,
+  type WalkCounter,
+  type WalletTrace,
+} from './trace-store';
 
-/** Ignore dust: rent-exemption top-ups and spam are not funding. */
-const MIN_FUNDING_SOL = 0.01;
-
-/** Pages walked backwards when looking for a wallet's earliest funding. */
+/** Pages added to a candidate's walk per visit. */
 const CANDIDATE_PAGES = 3;
-/** Pages of deployer history scanned. */
+/** Pages of deployer history walked. */
 const DEPLOYER_PAGES = 3;
+/** Pages walked when hunting a mint's creation transaction. */
+const MINT_PAGES = 5;
 /** Wallets funded by the deployer that get expanded one hop further. */
 const HOP_EXPANSION = 18;
-/** Candidates whose funding is traced. Ranked by preliminary score. */
+/** Candidates whose funding is walked. Ranked by preliminary score. */
 export const MAX_TRACED_CANDIDATES = 10;
 
 /**
@@ -63,45 +71,9 @@ export const MAX_TRACED_CANDIDATES = 10;
  * token* — links appearing and vanishing between runs. A forensic tool that is
  * not reproducible is worthless, so throughput is traded for determinism.
  *
- * Tracing is
- * a background-quality job, so it queues rather than races: a rate-limited page
- * returns nothing, and nothing is indistinguishable from "this wallet has no
- * funder" unless it is tracked separately — which is exactly the kind of
- * failure-as-finding this report must not produce.
+ * The cache is what keeps that affordable: most visits do no network work.
  */
 const TRACE_CONCURRENCY = 1;
-
-/**
- * A hundred transactions inside this window marks an address as a service —
- * exchange hot wallet, market maker, bot dispatcher. No individual transacts
- * at that rate, and treating one as a meaningful "shared funder" would group
- * every unrelated wallet that ever withdrew from the same exchange.
- */
-const SERVICE_VELOCITY_SECONDS = 3600;
-
-export interface FundingSource {
-  address: string;
-  sol: number;
-  at: number;
-  signature: string;
-}
-
-export interface FundingTrace {
-  address: string;
-  /** Earliest inbound SOL transfers we could observe, oldest first. */
-  sources: FundingSource[];
-  /**
-   * True when paging reached the wallet's first transaction, which is the only
-   * case where `sources` really is where the wallet's SOL came from. Short of
-   * that, these are simply the earliest transfers within the pages scanned —
-   * for a bot running hundreds of transactions an hour, that is trading flow,
-   * not origin.
-   */
-  originConfirmed: boolean;
-  /** The walk was cut short by an API error rather than by the page budget. */
-  failed: boolean;
-  pagesScanned: number;
-}
 
 export type LinkKind = 'direct' | 'one_hop' | 'funded_by_deployer_peer';
 
@@ -110,7 +82,7 @@ export interface DeployerLink {
   kind: LinkKind;
   /** deployer → … → candidate. */
   path: string[];
-  /** SOL that moved on the weakest edge of the path, for context. */
+  /** SOL observed on the deployer-side leg of the path. */
   sol: number | null;
 }
 
@@ -127,7 +99,7 @@ export interface SharedFunderGroup {
 export interface FundingGraph {
   links: DeployerLink[];
   sharedFunders: SharedFunderGroup[];
-  traces: Map<string, FundingTrace>;
+  traces: Map<string, WalletTrace>;
   stats: {
     candidatesTraced: number;
     /** Wallets whose funding origin was actually established. */
@@ -137,132 +109,12 @@ export interface FundingGraph {
     deployerOutboundWallets: number;
     hopWalletsExpanded: number;
     requests: number;
+    /** Walks served entirely from cache, doing no network work. */
+    cacheHits: number;
+    cacheMisses: number;
+    cacheAvailable: boolean;
   };
   notes: string[];
-}
-
-/** Pages an address's history backwards, newest first, up to `pages`. */
-async function history(
-  address: string,
-  pages: number,
-  counter: { requests: number; failures: number }
-): Promise<{
-  transactions: HeliusEnhancedTransaction[];
-  reachedGenesis: boolean;
-  failed: boolean;
-}> {
-  const transactions: HeliusEnhancedTransaction[] = [];
-  let before: string | undefined;
-  let reachedGenesis = false;
-  let failed = false;
-
-  for (let page = 0; page < pages; page += 1) {
-    counter.requests += 1;
-
-    let batch: HeliusEnhancedTransaction[];
-    try {
-      batch = await helius.getEnhancedHistory(address, { limit: 100, before });
-    } catch {
-      // A rate limit or timeout is missing evidence, never evidence of absence.
-      failed = true;
-      counter.failures += 1;
-      break;
-    }
-
-    if (!batch.length) {
-      reachedGenesis = true;
-      break;
-    }
-    transactions.push(...batch);
-
-    if (batch.length < 100) {
-      reachedGenesis = true;
-      break;
-    }
-    before = batch[batch.length - 1]?.signature;
-  }
-
-  return { transactions, reachedGenesis, failed };
-}
-
-interface Edge {
-  from: string;
-  to: string;
-  sol: number;
-  at: number;
-  signature: string;
-}
-
-/**
- * SOL movement between wallets, ignoring dust and self-transfers.
- *
- * Reads `nativeTransfers` first, then falls back to balance deltas. The
- * fallback matters more than it looks: a wallet can be the subject of a
- * transaction whose `nativeTransfers` list never names it — SOL routed through
- * a program shows up only as a balance change — and reading transfers alone
- * silently reports such a wallet as having no funding at all.
- */
-function nativeEdges(transactions: HeliusEnhancedTransaction[]): Edge[] {
-  const edges: Edge[] = [];
-
-  for (const tx of transactions) {
-    const named = new Set<string>();
-
-    for (const transfer of tx.nativeTransfers ?? []) {
-      const { fromUserAccount: from, toUserAccount: to } = transfer;
-      if (!from || !to || from === to) continue;
-
-      const sol = (transfer.amount ?? 0) / LAMPORTS_PER_SOL;
-      if (sol < MIN_FUNDING_SOL) continue;
-
-      named.add(from);
-      named.add(to);
-      edges.push({ from, to, sol, at: tx.timestamp, signature: tx.signature });
-    }
-
-    // Balance-delta fallback for accounts the transfer list did not mention.
-    const deltas = (tx.accountData ?? [])
-      .filter((entry) => entry.account && Math.abs(entry.nativeBalanceChange) > 0)
-      .sort((a, b) => a.nativeBalanceChange - b.nativeBalanceChange);
-    if (deltas.length < 2) continue;
-
-    const payer = deltas[0];
-    if (payer.nativeBalanceChange >= 0) continue;
-
-    for (const entry of deltas) {
-      if (entry.account === payer.account) continue;
-      if (named.has(entry.account)) continue;
-
-      const sol = entry.nativeBalanceChange / LAMPORTS_PER_SOL;
-      // Fees and rent are not funding, and the payer is charged both.
-      if (sol < MIN_FUNDING_SOL) continue;
-
-      edges.push({
-        from: payer.account,
-        to: entry.account,
-        sol,
-        at: tx.timestamp,
-        signature: tx.signature,
-      });
-    }
-  }
-
-  return edges;
-}
-
-/**
- * Velocity test for service addresses.
- *
- * Deliberately structural rather than a hardcoded exchange list. Guessing at
- * exchange addresses risks labelling a real participant as infrastructure,
- * which understates a finding exactly as badly as the reverse overstates it.
- */
-function looksLikeService(transactions: HeliusEnhancedTransaction[]): boolean {
-  if (transactions.length < 100) return false;
-  const newest = transactions[0]?.timestamp ?? 0;
-  const oldest = transactions[transactions.length - 1]?.timestamp ?? 0;
-  const span = newest - oldest;
-  return span > 0 && span < SERVICE_VELOCITY_SECONDS;
 }
 
 /**
@@ -270,68 +122,33 @@ function looksLikeService(transactions: HeliusEnhancedTransaction[]): boolean {
  *
  * Needed because the obvious source is useless on exactly the launches that
  * matter most. A pump.fun mint has no meaningful update authority — it reports
- * the System Program — so metadata alone leaves every pump.fun token without a
- * deployer, and pump.fun is where launch forensics is most often wanted.
+ * the System Program — so metadata alone leaves every launchpad token without a
+ * deployer, and launchpads are where forensics is most often wanted.
  *
  * The mint's oldest transaction is its creation, and that transaction's fee
- * payer is whoever paid to create it. Paging a mint back to genesis is cheap
- * for a young token and expensive for an old one, so the walk is capped and
- * simply gives up rather than guessing.
+ * payer is whoever paid to create it. Cached like any other walk, so a mint
+ * analysed twice costs nothing the second time.
  */
 export async function findMintCreator(
   mint: string,
-  counter: { requests: number; failures: number },
-  maxPages = 5
+  counter: WalkCounter
 ): Promise<{ address: string | null; via: 'mint_creation' | null }> {
-  const { transactions, reachedGenesis } = await history(mint, maxPages, counter);
-  if (!reachedGenesis || !transactions.length) return { address: null, via: null };
-
-  // History comes back newest-first, so the creation transaction is last.
-  const genesis = transactions[transactions.length - 1];
-  const payer = genesis?.feePayer;
-  if (!payer) return { address: null, via: null };
+  const trace = await ensureTrace(mint, MINT_PAGES, counter);
+  if (!trace.originConfirmed || !trace.genesisFeePayer) return { address: null, via: null };
 
   // A launchpad paying the fee is the platform, not the person.
-  if (identifyAddress(payer).kind !== 'unidentified') return { address: null, via: null };
-
-  return { address: payer, via: 'mint_creation' };
-}
-
-/** Earliest inbound SOL for one wallet, within a page budget. */
-export async function traceFunding(
-  address: string,
-  counter: { requests: number; failures: number }
-): Promise<FundingTrace> {
-  const { transactions, reachedGenesis, failed } = await history(address, CANDIDATE_PAGES, counter);
-
-  const inbound = nativeEdges(transactions)
-    .filter((edge) => edge.to === address)
-    .sort((a, b) => a.at - b.at);
-
-  // Only the earliest few matter. Later top-ups say nothing about origin.
-  const sources: FundingSource[] = [];
-  const seen = new Set<string>();
-  for (const edge of inbound) {
-    if (seen.has(edge.from)) continue;
-    seen.add(edge.from);
-    sources.push({ address: edge.from, sol: edge.sol, at: edge.at, signature: edge.signature });
-    if (sources.length >= 3) break;
+  if (identifyAddress(trace.genesisFeePayer).kind !== 'unidentified') {
+    return { address: null, via: null };
   }
 
-  return {
-    address,
-    sources,
-    originConfirmed: reachedGenesis && !failed,
-    failed,
-    pagesScanned: Math.ceil(transactions.length / 100) || 1,
-  };
+  return { address: trace.genesisFeePayer, via: 'mint_creation' };
 }
 
 /**
  * Builds the funding graph around a launch.
  *
  * `candidates` should already be ranked — only the first
- * `MAX_TRACED_CANDIDATES` are traced, because each costs several requests.
+ * `MAX_TRACED_CANDIDATES` are walked, because each may cost several requests.
  */
 export async function buildFundingGraph(opts: {
   deployer: string | null;
@@ -340,11 +157,12 @@ export async function buildFundingGraph(opts: {
   /**
    * Every early buyer. Checking these against the deployer's outbound set costs
    * nothing extra — the set is already in memory — so a direct link is caught
-   * even for a wallet too far down the ranking to be worth tracing.
+   * even for a wallet too far down the ranking to be worth walking.
    */
   allBuyers?: string[];
+  counter?: WalkCounter;
 }): Promise<FundingGraph> {
-  const counter = { requests: 0, failures: 0 };
+  const counter = opts.counter ?? newCounter();
   const notes: string[] = [];
   const { deployer } = opts;
   const candidates = opts.candidates.slice(0, MAX_TRACED_CANDIDATES);
@@ -352,15 +170,15 @@ export async function buildFundingGraph(opts: {
   // --- deployer side: who did it fund, and who did they fund ---------------
   const deployerFunded = new Map<string, number>();
   const hopRecipients = new Map<string, Set<string>>();
-
   let deployerScanFailed = false;
+
   if (deployer) {
-    const { transactions, failed } = await history(deployer, DEPLOYER_PAGES, counter);
-    deployerScanFailed = failed;
-    for (const edge of nativeEdges(transactions)) {
-      if (edge.from !== deployer) continue;
-      if (isNonDiscretionaryHolder(identifyAddress(edge.to).kind)) continue;
-      deployerFunded.set(edge.to, (deployerFunded.get(edge.to) ?? 0) + edge.sol);
+    const trace = await ensureTrace(deployer, DEPLOYER_PAGES, counter, { needOutbound: true });
+    deployerScanFailed = trace.lastWalkFailed;
+
+    for (const recipient of trace.outbound) {
+      if (isNonDiscretionaryHolder(identifyAddress(recipient.address).kind)) continue;
+      deployerFunded.set(recipient.address, recipient.sol);
     }
 
     // Expand the largest recipients one hop. Largest first because a wallet the
@@ -372,12 +190,8 @@ export async function buildFundingGraph(opts: {
       .map(([address]) => address);
 
     await mapWithConcurrency(toExpand, TRACE_CONCURRENCY, async (address) => {
-      const { transactions: hopTxs } = await history(address, 1, counter);
-      const recipients = new Set<string>();
-      for (const edge of nativeEdges(hopTxs)) {
-        if (edge.from === address) recipients.add(edge.to);
-      }
-      hopRecipients.set(address, recipients);
+      const hop = await ensureTrace(address, 1, counter, { needOutbound: true });
+      hopRecipients.set(address, new Set(hop.outbound.map((r) => r.address)));
     });
 
     if (deployerScanFailed) {
@@ -392,20 +206,29 @@ export async function buildFundingGraph(opts: {
   }
 
   // --- candidate side: where did each one's SOL come from ------------------
-  const traces = new Map<string, FundingTrace>();
+  // Loaded as one batch first, so cached wallets cost a single query between
+  // them rather than one query each.
+  const cached = await loadTraces(candidates, counter);
+  const traces = new Map<string, WalletTrace>();
+
   await mapWithConcurrency(candidates, TRACE_CONCURRENCY, async (address) => {
-    traces.set(address, await traceFunding(address, counter));
+    const base = cached.get(address);
+    // Each visit adds pages rather than repeating the last ones.
+    const trace = base
+      ? await extendTrace(base, base.pagesWalked + CANDIDATE_PAGES, counter)
+      : await ensureTrace(address, CANDIDATE_PAGES, counter);
+    traces.set(address, trace);
   });
 
-  // --- service detection for funders that group several candidates ---------
+  // --- shared funders -------------------------------------------------------
   const funderMembers = new Map<string, string[]>();
   const funderSol = new Map<string, number>();
   for (const [candidate, trace] of traces) {
     // An unconfirmed origin is a counterparty, not a funder. Grouping on those
     // would cluster unrelated bots that happened to receive from the same
-    // router within the pages scanned.
+    // router within the pages walked.
     if (!trace.originConfirmed) continue;
-    for (const source of trace.sources) {
+    for (const source of trace.inbound) {
       if (source.address === deployer) continue; // that is a direct link, not a group
       funderMembers.set(source.address, [...(funderMembers.get(source.address) ?? []), candidate]);
       funderSol.set(source.address, (funderSol.get(source.address) ?? 0) + source.sol);
@@ -413,36 +236,41 @@ export async function buildFundingGraph(opts: {
   }
 
   const grouped = [...funderMembers.entries()].filter(([, members]) => members.length >= 2);
-
   const sharedFunders: SharedFunderGroup[] = [];
+
   await mapWithConcurrency(grouped, TRACE_CONCURRENCY, async ([funder, members]) => {
     const entity = identifyAddress(funder);
-    const { transactions } = await history(funder, 1, counter);
+    // One page is enough to measure velocity, and it is cached afterwards.
+    const trace = await ensureTrace(funder, 1, counter);
     sharedFunders.push({
       funder,
       members,
       totalSol: funderSol.get(funder) ?? 0,
-      likelyService: looksLikeService(transactions),
+      likelyService: trace.likelyService === true,
       label: entity.kind === 'unidentified' ? null : entity.label,
     });
   });
 
-  sharedFunders.sort((a, b) => Number(a.likelyService) - Number(b.likelyService) || b.members.length - a.members.length);
+  sharedFunders.sort(
+    (a, b) =>
+      Number(a.likelyService) - Number(b.likelyService) || b.members.length - a.members.length
+  );
 
   // --- resolve links --------------------------------------------------------
   const links: DeployerLink[] = [];
 
   if (deployer) {
-    // Cheap pass first: anyone the deployer paid directly, traced or not.
+    // Cheap pass first: anyone the deployer paid directly, walked or not.
     const cheapScope = new Set([...(opts.allBuyers ?? []), ...candidates]);
     // The deployer buying its own token is worth knowing, but it is not a
     // "funding link" — reporting deployer → x → deployer as a connection is
     // just noise with a self-referential path.
     cheapScope.delete(deployer);
+
     for (const candidate of cheapScope) {
       const trace = traces.get(candidate);
+      const confirmed = trace?.originConfirmed ? trace : undefined;
 
-      // Direct: the deployer funded this wallet, seen from either side.
       if (deployerFunded.has(candidate)) {
         links.push({
           candidate,
@@ -453,8 +281,7 @@ export async function buildFundingGraph(opts: {
         continue;
       }
 
-      const confirmed = trace?.originConfirmed ? trace : undefined;
-      const fromDeployer = confirmed?.sources.find((s) => s.address === deployer);
+      const fromDeployer = confirmed?.inbound.find((s) => s.address === deployer);
       if (fromDeployer) {
         links.push({
           candidate,
@@ -466,13 +293,13 @@ export async function buildFundingGraph(opts: {
       }
 
       // One hop: this wallet's funder is itself a wallet the deployer funded.
-      const viaSource = confirmed?.sources.find((s) => deployerFunded.has(s.address));
+      const viaSource = confirmed?.inbound.find((s) => deployerFunded.has(s.address));
       if (viaSource) {
         links.push({
           candidate,
           kind: 'one_hop',
           path: [deployer, viaSource.address, candidate],
-          sol: Math.min(viaSource.sol, deployerFunded.get(viaSource.address) ?? viaSource.sol),
+          sol: deployerFunded.get(viaSource.address) ?? viaSource.sol,
         });
         continue;
       }
@@ -492,18 +319,27 @@ export async function buildFundingGraph(opts: {
     }
   }
 
-  const confirmed = [...traces.values()].filter((t) => t.originConfirmed).length;
-  const failed = [...traces.values()].filter((t) => t.failed).length;
+  const confirmedCount = [...traces.values()].filter((t) => t.originConfirmed).length;
+  const failed = [...traces.values()].filter((t) => t.lastWalkFailed).length;
 
   if (failed > 0) {
     notes.push(
-      `${failed} of ${candidates.length} funding walks were cut short by API rate limits, so those wallets were not checked at all. That is missing data, not an absence of connections.`
+      `${failed} of ${candidates.length} funding walks were cut short by API rate limits, so those wallets were not fully checked. That is missing data, not an absence of connections.`
     );
   }
-  const budgetLimited = candidates.length - confirmed - failed;
+
+  const budgetLimited = candidates.length - confirmedCount - failed;
   if (budgetLimited > 0) {
     notes.push(
-      `${budgetLimited} wallets have more history than the ${CANDIDATE_PAGES}-page budget covers, so their original funding source was never reached and they were excluded from link and shared-source detection. High-frequency bots fall into this group; wallets created shortly before the launch generally do not.`
+      counter.cacheAvailable
+        ? `${budgetLimited} wallets have more history than this pass could cover, so their original funding source was not reached and they were excluded from link and shared-source detection. Each analysis walks them further back, so re-running deepens the result rather than repeating it.`
+        : `${budgetLimited} wallets have more history than the ${CANDIDATE_PAGES}-page budget covers, and with no trace cache every run restarts from the same point.`
+    );
+  }
+
+  if (!counter.cacheAvailable) {
+    notes.push(
+      'The wallet_traces cache table is missing, so nothing walked here is remembered for next time. Apply supabase/migrations/002_wallet_traces.sql to let repeated analyses reach further back.'
     );
   }
 
@@ -513,11 +349,14 @@ export async function buildFundingGraph(opts: {
     traces,
     stats: {
       candidatesTraced: candidates.length,
-      candidatesReachedGenesis: confirmed,
+      candidatesReachedGenesis: confirmedCount,
       tracesFailed: failed,
       deployerOutboundWallets: deployerFunded.size,
       hopWalletsExpanded: hopRecipients.size,
       requests: counter.requests,
+      cacheHits: counter.cacheHits,
+      cacheMisses: counter.cacheMisses,
+      cacheAvailable: counter.cacheAvailable,
     },
     notes,
   };

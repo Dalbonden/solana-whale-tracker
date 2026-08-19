@@ -241,6 +241,8 @@ GET /api/cron/tokens?discover=true
 GET /api/cron/portfolios?limit=60&prune=true
 GET /api/cron/webhook-sync
 GET /api/cron/rebuild-positions        # replay trades into the position ledger
+GET /api/cron/backfill?limit=5&max=400 # walk whale history backwards
+GET /api/cron/deepen-traces?limit=25   # walk cached wallet histories further back
 ```
 
 ---

@@ -41,6 +41,7 @@ import {
   type DeployerLink,
   type SharedFunderGroup,
 } from './funding-graph';
+import { newCounter } from './trace-store';
 
 /** Buys inside this window of the first trade are treated as launch snipes. */
 const SNIPE_WINDOW_SECONDS = 60;
@@ -141,6 +142,9 @@ export interface ForensicsReport {
     deployerOutboundWallets: number;
     hopWalletsExpanded: number;
     requests: number;
+    cacheHits: number;
+    cacheMisses: number;
+    cacheAvailable: boolean;
   };
   summary: string[];
   /** What could not be determined, stated plainly rather than left implied. */
@@ -156,6 +160,9 @@ function levelFor(score: number): SuspicionLevel {
 
 export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
   const limitations: string[] = [];
+  // One counter for the whole analysis, so mint-creator lookup, deployer scan
+  // and candidate walks share a single cache session and request tally.
+  const walkCounter = newCounter();
 
   const [trades, holders, mintInfo, updateAuthority] = await Promise.all([
     birdeye.getEarliestTrades(mint, EARLY_TRADE_SAMPLE).catch(() => []),
@@ -191,6 +198,9 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
       deployerOutboundWallets: 0,
       hopWalletsExpanded: 0,
       requests: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
+      cacheAvailable: true,
     },
     summary: [],
     limitations,
@@ -218,8 +228,7 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
   // Metadata is a dead end on launchpad tokens, which are most of what anyone
   // wants analysed. Fall back to whoever paid to create the mint.
   if (!deployer) {
-    const creatorCounter = { requests: 0, failures: 0 };
-    const creator = await findMintCreator(mint, creatorCounter).catch(() => ({
+    const creator = await findMintCreator(mint, walkCounter).catch(() => ({
       address: null,
       via: null as null,
     }));
@@ -553,6 +562,7 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
     deployer,
     candidates: preliminary.slice(0, MAX_TRACED_CANDIDATES).map((entry) => entry.address),
     allBuyers: preliminary.map((entry) => entry.address),
+    counter: walkCounter,
   });
 
   const linkByCandidate = new Map(graph.links.map((link) => [link.candidate, link]));
