@@ -271,6 +271,142 @@ export async function getOhlcv(
   return payload?.data?.items ?? [];
 }
 
+// --- Token-level trade and holder feeds --------------------------------------
+
+export interface BirdeyeTokenTrade {
+  owner: string;
+  side: 'buy' | 'sell';
+  blockUnixTime: number;
+  txHash: string;
+  source: string;
+  /** Token units moved on the meme leg. */
+  tokenAmount: number;
+  /** Value of the trade in USD, from the quote leg where present. */
+  usdValue: number | null;
+  priceUsd: number | null;
+}
+
+/** One side of a swap. `price` is present on the quote leg only. */
+interface RawTradeLeg {
+  address?: string;
+  uiChangeAmount?: number;
+  uiAmount?: number;
+  price?: number | null;
+}
+
+interface RawTokenTrade {
+  owner?: string;
+  side?: string;
+  blockUnixTime?: number;
+  txHash?: string;
+  source?: string;
+  quotePrice?: number | null;
+  base?: RawTradeLeg;
+  quote?: RawTradeLeg;
+}
+
+function normaliseTrade(raw: RawTokenTrade, mint: string): BirdeyeTokenTrade | null {
+  if (!raw.owner || !raw.blockUnixTime || !raw.txHash) return null;
+
+  // The meme leg is whichever side of the pair is the token we asked about.
+  const baseIsToken = raw.base?.address === mint;
+  const tokenLeg = baseIsToken ? raw.base : raw.quote;
+  const otherLeg = baseIsToken ? raw.quote : raw.base;
+
+  const tokenAmount = Math.abs(tokenLeg?.uiChangeAmount ?? tokenLeg?.uiAmount ?? 0);
+  if (!tokenAmount) return null;
+
+  // Valued from the counter leg, matching how live trades are valued: the quote
+  // side is a liquid asset with a trustworthy price, the meme side is not.
+  const otherAmount = Math.abs(otherLeg?.uiChangeAmount ?? otherLeg?.uiAmount ?? 0);
+  const otherPrice = otherLeg?.price ?? null;
+  const usdValue = otherPrice !== null && otherAmount ? otherAmount * otherPrice : null;
+
+  return {
+    owner: raw.owner,
+    side: raw.side === 'sell' ? 'sell' : 'buy',
+    blockUnixTime: raw.blockUnixTime,
+    txHash: raw.txHash,
+    source: raw.source ?? 'unknown',
+    tokenAmount,
+    usdValue,
+    priceUsd: usdValue !== null && tokenAmount > 0 ? usdValue / tokenAmount : null,
+  };
+}
+
+/**
+ * Swaps for one token, oldest-first when `order` is 'asc'.
+ *
+ * Ascending order is what makes launch forensics possible at all. Reaching a
+ * token's first trades by paging a wallet or mint history backwards is
+ * unbounded — an established token has millions of transactions in front of
+ * them — whereas this returns the genesis trades in a single call.
+ */
+export async function getTokenTrades(
+  mint: string,
+  opts: { order?: 'asc' | 'desc'; limit?: number; offset?: number } = {}
+): Promise<BirdeyeTokenTrade[]> {
+  if (!config.birdeye.enabled) return [];
+  const { order = 'asc', limit = 50, offset = 0 } = opts;
+
+  const payload = await requestSoft<BirdeyeEnvelope<{ items: RawTokenTrade[] }>>(
+    url('/defi/txs/token', {
+      address: mint,
+      tx_type: 'swap',
+      sort_type: order,
+      limit: Math.min(limit, 50),
+      offset,
+    }),
+    { headers: headers(), label: 'birdeye-token-trades', timeoutMs: 25_000 },
+    { success: false, data: { items: [] } }
+  );
+
+  return (payload?.data?.items ?? [])
+    .map((raw) => normaliseTrade(raw, mint))
+    .filter((t): t is BirdeyeTokenTrade => t !== null);
+}
+
+/** Pages ascending trades up to `max`, stopping early when the feed runs out. */
+export async function getEarliestTrades(mint: string, max = 200): Promise<BirdeyeTokenTrade[]> {
+  const collected: BirdeyeTokenTrade[] = [];
+  const pageSize = 50;
+
+  for (let offset = 0; collected.length < max; offset += pageSize) {
+    const page = await getTokenTrades(mint, {
+      order: 'asc',
+      limit: Math.min(pageSize, max - collected.length),
+      offset,
+    });
+    if (!page.length) break;
+    collected.push(...page);
+    if (page.length < pageSize) break;
+  }
+
+  return collected;
+}
+
+export interface BirdeyeHolder {
+  owner: string;
+  uiAmount: number;
+}
+
+/** Largest holders by owner. Resolves owners directly, unlike RPC. */
+export async function getTokenHolders(mint: string, limit = 50): Promise<BirdeyeHolder[]> {
+  if (!config.birdeye.enabled) return [];
+
+  const payload = await requestSoft<
+    BirdeyeEnvelope<{ items: Array<{ owner?: string; ui_amount?: number }> }>
+  >(
+    url('/defi/v3/token/holder', { address: mint, limit: Math.min(limit, 100), offset: 0 }),
+    { headers: headers(), label: 'birdeye-token-holders', timeoutMs: 25_000 },
+    { success: false, data: { items: [] } }
+  );
+
+  return (payload?.data?.items ?? [])
+    .filter((h) => h.owner)
+    .map((h) => ({ owner: h.owner as string, uiAmount: Number(h.ui_amount) || 0 }));
+}
+
 /** OHLCV over an explicit window, for pricing historical trades. */
 export async function getOhlcvRange(
   mint: string,

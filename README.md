@@ -227,6 +227,7 @@ PATCH  /api/tokens                     { mint, is_active }
 GET    /api/tokens/:mint/chart?interval=15m&hours=24
 
 GET    /api/alerts?type=cluster_buy&severity=critical&since=<iso>
+GET    /api/tokens/:mint/forensics     launch behaviour analysis
 GET    /api/stream                     Server-Sent Events: trades, alerts
 GET    /api/health
 ```
