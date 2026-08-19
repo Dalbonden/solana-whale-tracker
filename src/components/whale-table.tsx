@@ -4,6 +4,7 @@ import { ArrowUpDown, Search } from 'lucide-react';
 import Link from 'next/link';
 import { useMemo, useState } from 'react';
 
+import { ArchetypeBadges, type ArchetypeView } from '@/components/archetype-badges';
 import { Badge } from '@/components/ui/badge';
 import { Input } from '@/components/ui/input';
 import {
@@ -27,7 +28,16 @@ const COLUMNS: Array<{ key: SortKey; label: string; align?: 'right' }> = [
   { key: 'last_active_at', label: 'Last active', align: 'right' },
 ];
 
-export function WhaleTable({ whales, showSearch = true }: { whales: Whale[]; showSearch?: boolean }) {
+export function WhaleTable({
+  whales,
+  showSearch = true,
+  archetypes,
+}: {
+  whales: Whale[];
+  showSearch?: boolean;
+  /** Behaviour tags keyed by address. Absent when the caller did not load them. */
+  archetypes?: Record<string, ArchetypeView[]>;
+}) {
   const [query, setQuery] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('score');
 
@@ -114,6 +124,13 @@ export function WhaleTable({ whales, showSearch = true }: { whales: Whale[]; sho
                       {shortenAddress(whale.address, 4)}
                     </p>
                   )}
+                  {archetypes?.[whale.address]?.length ? (
+                    <ArchetypeBadges
+                      archetypes={archetypes[whale.address]}
+                      limit={3}
+                      className="mt-1"
+                    />
+                  ) : null}
                 </TableCell>
 
                 <TableCell>

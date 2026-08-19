@@ -7,6 +7,8 @@ import { SetupNotice } from '@/components/setup-notice';
 import { StatCards, type Stat } from '@/components/stat-cards';
 import { TokenLeaderboard } from '@/components/token-leaderboard';
 import { WhaleTable } from '@/components/whale-table';
+import type { ArchetypeView } from '@/components/archetype-badges';
+import { buildArchetypeMetrics } from '@/lib/core/wallet-profile';
 import { Button } from '@/components/ui/button';
 import {
   getDashboardStats,
@@ -41,6 +43,14 @@ export default async function DashboardPage() {
   }
 
   const { stats, whales, trades, alerts, leaderboard } = data;
+
+  // Behaviour tags are an enhancement: if the aggregation fails the dashboard
+  // still renders, just without badges.
+  const profiles = await buildArchetypeMetrics(whales.rows).catch(() => null);
+  const archetypes: Record<string, ArchetypeView[]> = {};
+  if (profiles) {
+    for (const [address, profile] of profiles) archetypes[address] = profile.archetypes;
+  }
 
   const cards: Stat[] = [
     { label: 'Whales tracked', value: stats.whaleCount.toLocaleString(), icon: Waves },
@@ -80,7 +90,7 @@ export default async function DashboardPage() {
               subtitle="Highest composite score across portfolio, size, frequency and meme exposure"
               href="/whales"
             />
-            <WhaleTable whales={whales.rows} showSearch={false} />
+            <WhaleTable whales={whales.rows} showSearch={false} archetypes={archetypes} />
           </section>
         </div>
 

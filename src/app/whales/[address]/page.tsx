@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { notFound } from 'next/navigation';
 
 import { AlertList } from '@/components/alert-list';
+import { ArchetypePanel } from '@/components/archetype-badges';
 import { PortfolioAllocation, PortfolioTimeline } from '@/components/portfolio-chart';
 import { PositionsTable } from '@/components/positions-table';
 import { SetupNotice } from '@/components/setup-notice';
@@ -21,6 +22,7 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { derivePositionView } from '@/lib/core/positions';
+import { buildArchetypeMetrics } from '@/lib/core/wallet-profile';
 import {
   getCurrentPortfolio,
   getPortfolioTimeline,
@@ -84,13 +86,25 @@ export default async function WhaleProfilePage({ params }: { params: { address: 
       derivePositionView(position, prices.get(position.token_mint) ?? null, bookValue)
     );
 
-    data = { whale, portfolio, timeline, trades, alerts, positions: positionViews };
+    // Classification is derived on read: a stored badge would go stale, and a
+    // wrong "smart money" label is worse than a slightly slower page.
+    const profile = (await buildArchetypeMetrics([whale]).catch(() => null))?.get(address) ?? null;
+
+    data = {
+      whale,
+      portfolio,
+      timeline,
+      trades,
+      alerts,
+      positions: positionViews,
+      archetypes: profile?.archetypes ?? [],
+    };
   } catch (error) {
     if ((error as Error).message === 'NEXT_NOT_FOUND') throw error;
     return <SetupNotice error={(error as Error).message} />;
   }
 
-  const { whale, portfolio, timeline, trades, alerts, positions } = data;
+  const { whale, portfolio, timeline, trades, alerts, positions, archetypes } = data;
 
   const memeHoldings = portfolio.filter((holding) => holding.is_meme);
   // A null price means no feed covered the mint — not that it is worthless.
@@ -196,6 +210,22 @@ export default async function WhaleProfilePage({ params }: { params: { address: 
       </div>
 
       <StatCards stats={cards} />
+
+      {archetypes.length > 0 && (
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">How this wallet behaves</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            <ArchetypePanel archetypes={archetypes} />
+            <p className="border-t border-border pt-3 text-[11px] text-muted-foreground">
+              Descriptions of measured behaviour over the activity we have recorded, not claims
+              about who controls this wallet. Tags marked provisional rest on a small sample and can
+              change.
+            </p>
+          </CardContent>
+        </Card>
+      )}
 
       <div className="grid gap-6 lg:grid-cols-2">
         <Card>

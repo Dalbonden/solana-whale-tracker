@@ -3,6 +3,8 @@ import type { Metadata } from 'next';
 import { SetupNotice } from '@/components/setup-notice';
 import { StatCards, type Stat } from '@/components/stat-cards';
 import { WhaleTable } from '@/components/whale-table';
+import type { ArchetypeView } from '@/components/archetype-badges';
+import { buildArchetypeMetrics } from '@/lib/core/wallet-profile';
 import { listWhales } from '@/lib/db/repositories';
 import { formatUsd } from '@/lib/utils';
 
@@ -35,6 +37,14 @@ export default async function WhalesPage({
 
   const { rows, count } = result;
 
+  // Batched into a fixed number of queries rather than one per whale, and
+  // allowed to fail: behaviour tags are an enhancement, not the page.
+  const profiles = await buildArchetypeMetrics(rows).catch(() => null);
+  const archetypes: Record<string, ArchetypeView[]> = {};
+  if (profiles) {
+    for (const [address, profile] of profiles) archetypes[address] = profile.archetypes;
+  }
+
   const aggregate = rows.reduce(
     (acc, whale) => ({
       portfolio: acc.portfolio + whale.portfolio_value_usd,
@@ -62,7 +72,7 @@ export default async function WhalesPage({
     <div className="space-y-6">
       <Header />
       <StatCards stats={cards} />
-      <WhaleTable whales={rows} />
+      <WhaleTable whales={rows} archetypes={archetypes} />
 
       {count > rows.length && (
         <p className="text-center text-xs text-muted-foreground">

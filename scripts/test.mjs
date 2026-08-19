@@ -29,6 +29,7 @@ const compile = spawnSync(
     'src/lib/solana/parse.ts',
     'src/lib/solana/constants.ts',
     'src/lib/core/positions.ts',
+    'src/lib/core/archetypes.ts',
     '--rootDir',
     'src/lib',
     '--outDir',
