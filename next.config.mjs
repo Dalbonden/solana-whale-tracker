@@ -14,6 +14,11 @@ const nextConfig = {
       { protocol: 'https', hostname: 'cdn.jsdelivr.net' },
     ],
   },
+  experimental: {
+    // Enables src/instrumentation.ts, which starts the in-process scheduler on
+    // server boot. Stable from Next 15; still behind a flag on 14.
+    instrumentationHook: true,
+  },
   eslint: {
     // Type errors still fail the build; lint noise should not block deploys.
     ignoreDuringBuilds: true,

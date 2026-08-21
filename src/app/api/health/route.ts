@@ -1,6 +1,7 @@
 import { handleError, ok } from '@/lib/api';
 import { config, integrationStatus } from '@/lib/config';
 import { dbHealthy } from '@/lib/db/client';
+import { schedulerStatus } from '@/lib/core/scheduler';
 import { getRecentJobRuns } from '@/lib/db/repositories';
 
 export const dynamic = 'force-dynamic';
@@ -68,7 +69,8 @@ export async function GET() {
             : undefined,
         },
         rpc: config.solana.rpcUrl.replace(/api-key=[^&]+/, 'api-key=***'),
-        recentJobs: jobs,
+        scheduler: schedulerStatus(),
+      recentJobs: jobs,
         timestamp: new Date().toISOString(),
       },
       { status: degraded ? 207 : 200 }

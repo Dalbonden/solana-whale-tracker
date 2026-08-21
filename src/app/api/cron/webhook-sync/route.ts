@@ -1,4 +1,4 @@
-import { authorizeJob, fail, runJob } from '@/lib/api';
+import { authorizeJob, fail, ok, runJob } from '@/lib/api';
 import { config } from '@/lib/config';
 import { getTrackedAddresses } from '@/lib/db/repositories';
 import { upsertWebhook } from '@/lib/providers/helius';
@@ -26,6 +26,22 @@ export async function GET(request: Request) {
   }
   if (!config.auth.webhookSecret) {
     return fail('HELIUS_WEBHOOK_SECRET is not set; refusing to register an unauthenticated webhook.', 503);
+  }
+
+  /*
+   * A webhook is Helius calling us, so it needs an address Helius can reach.
+   * Running locally the resolved app URL is loopback, and Helius answers 400 —
+   * a guaranteed failure the job can see coming. Reporting it as an error made
+   * the scheduler log a 500 every cycle in development for a condition that is
+   * simply not applicable there.
+   */
+  const appUrl = config.app.url;
+  if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])/i.test(appUrl)) {
+    return ok({
+      job: 'cron.webhook-sync',
+      status: 'skipped',
+      note: `App URL is ${appUrl}, which Helius cannot reach. Webhook registration only applies to a deployed instance.`,
+    });
   }
 
   return runJob('cron.webhook-sync', async () => {
