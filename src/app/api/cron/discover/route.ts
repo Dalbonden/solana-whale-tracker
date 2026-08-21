@@ -41,6 +41,9 @@ export async function GET(request: Request) {
       processed: result.evaluated,
       created: result.qualified,
       candidates: result.candidates,
+      // Seeded from the realised-profit leaderboard rather than from volume.
+      profitableSeeds: result.profitableSeeds,
+      emptyShellsSkipped: result.emptyShellsSkipped,
       added: result.added,
       // Rejections are the useful debugging output when nothing qualifies.
       rejectedSample: result.rejected.slice(0, 10),

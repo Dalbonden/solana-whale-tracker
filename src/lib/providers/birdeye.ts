@@ -678,6 +678,97 @@ export async function getTopTraders(
   return payload?.data?.items ?? [];
 }
 
+// --- Profitable traders ------------------------------------------------------
+
+export type TraderWindow = 'today' | 'yesterday' | '1W' | '30d' | '90d';
+
+export interface ProfitableTrader {
+  address: string;
+  /** Profit actually taken. The only number here worth trusting. */
+  realizedPnlUsd: number;
+  /** Reported paper gain. Frequently nonsense — see below. */
+  unrealizedPnlUsd: number;
+  volumeUsd: number;
+  tradeCount: number;
+}
+
+/**
+ * Wallets ranked by profit actually realised.
+ *
+ * Sorting by headline PnL is worse than useless here. Measured over the top 100
+ * for one week: 67 wallets had realised nothing at all, 64 had fewer than ten
+ * trades, and the leaders were holding illiquid bags marked at absurd prices —
+ * one showed $22M of "profit" on $946 of lifetime volume. Seeding a whale
+ * roster from that list fills it with people holding worthless tokens.
+ *
+ * Sorting by `realized_pnl` returns a different population entirely: wallets
+ * with hundreds of trades, real volume, and money actually taken off the table.
+ *
+ * So unrealised gains are treated as unreliable throughout. A wallet qualifies
+ * on money it has actually banked, and the mark-to-market number is only used
+ * to *reject* — an implausible ratio of paper gains to volume means the feed's
+ * pricing cannot be trusted for that wallet.
+ */
+export async function getProfitableTraders(
+  opts: { window?: TraderWindow; limit?: number; minRealizedUsd?: number; minTrades?: number } = {}
+): Promise<ProfitableTrader[]> {
+  if (!config.birdeye.enabled) return [];
+
+  const { window = '1W', limit = 100, minRealizedUsd = 5_000, minTrades = 10 } = opts;
+
+  const rows: Array<{
+    address?: string;
+    realized_pnl?: number;
+    unrealized_pnl?: number;
+    volume?: number;
+    trade_count?: number;
+  }> = [];
+
+  // The endpoint caps a page at 50.
+  for (let offset = 0; offset < Math.min(limit, 200); offset += 50) {
+    const payload = await requestSoft<BirdeyeEnvelope<{ items: typeof rows }>>(
+      url('/trader/gainers-losers', {
+        type: window,
+        sort_by: 'realized_pnl',
+        sort_type: 'desc',
+        offset,
+        limit: 50,
+      }),
+      { headers: headers(), label: 'birdeye-gainers', timeoutMs: 25_000 },
+      { success: false, data: { items: [] } }
+    );
+    const page = payload?.data?.items ?? [];
+    if (!page.length) break;
+    rows.push(...page);
+    if (page.length < 50) break;
+  }
+
+  /** Paper gains larger than this multiple of traded volume are not believable. */
+  const MAX_PAPER_TO_VOLUME = 20;
+
+  return rows
+    .filter((row) => {
+      if (!row.address) return false;
+      const realized = row.realized_pnl ?? 0;
+      const volume = row.volume ?? 0;
+      const trades = row.trade_count ?? 0;
+
+      // Banked profit, on a record long enough not to be luck.
+      if (realized < minRealizedUsd || trades < minTrades || volume <= 0) return false;
+
+      // Reject wallets whose paper gains imply a price the feed cannot support.
+      const paperRatio = Math.abs(row.unrealized_pnl ?? 0) / volume;
+      return paperRatio < MAX_PAPER_TO_VOLUME;
+    })
+    .map((row) => ({
+      address: row.address as string,
+      realizedPnlUsd: row.realized_pnl ?? 0,
+      unrealizedPnlUsd: row.unrealized_pnl ?? 0,
+      volumeUsd: row.volume ?? 0,
+      tradeCount: row.trade_count ?? 0,
+    }));
+}
+
 /** Throws (rather than soft-failing) so `/api/health` can report the real error. */
 export async function ping(): Promise<boolean> {
   if (!config.birdeye.enabled) return false;

@@ -211,6 +211,8 @@ export interface WhaleScore {
     frequency: number;
     memeExposure: number;
     diversity: number;
+    /** Money actually banked. Zero when the wallet has no observed record. */
+    profitability: number;
   };
 }
 

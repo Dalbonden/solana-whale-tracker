@@ -41,12 +41,27 @@ function linNorm(value: number, min: number, max: number): number {
   return (value - min) / (max - min);
 }
 
+/*
+ * Weights.
+ *
+ * `profitability` was added after the roster filled with wallets that trade
+ * enormously and lose steadily: six of the first ten classified as
+ * "distributing", 78 losing sells against 27 winners, net realised P&L of
+ * -$201. Nothing in the original score rewarded making money, so the pipeline
+ * optimised for size and churn — and churn correlates with losses.
+ *
+ * Portfolio and trade size gave up ten points between them to fund it. Being
+ * rich is a weaker signal than getting richer: a large balance can be inherited
+ * from one lucky position or from a wallet that has been bleeding for months,
+ * whereas banked profit is evidence of a repeatable process.
+ */
 const WEIGHTS = {
-  portfolio: 0.35,
-  tradeSize: 0.25,
-  frequency: 0.2,
-  memeExposure: 0.15,
+  portfolio: 0.28,
+  tradeSize: 0.2,
+  frequency: 0.17,
+  memeExposure: 0.13,
   diversity: 0.05,
+  profitability: 0.17,
 } as const;
 
 export function tierForScore(score: number): WhaleTier {
@@ -82,6 +97,18 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
   const flowEngagement = linNorm(metrics.tradeCount30d, 5, 120) * 0.7;
   const memeEngagement = Math.min(Math.max(metrics.memeExposurePct, flowEngagement), 1);
 
+  /*
+   * Profitability from money actually banked.
+   *
+   * Realised only — paper gains are not evidence. A wallet is credited from
+   * $1k of realised profit and saturates at $1M; losses score zero rather than
+   * negative, because an unprofitable wallet may still be worth tracking (a
+   * large distributor moves markets regardless of whether it is any good at
+   * it), it just should not outrank a profitable one.
+   */
+  const profitability =
+    metrics.realizedPnlUsd > 0 ? logNorm(metrics.realizedPnlUsd, 1_000, 1_000_000) : 0;
+
   const components = {
     // $50k → 0, $50M → 1
     portfolio: logNorm(metrics.portfolioValueUsd, 50_000, 50_000_000),
@@ -92,6 +119,7 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
     memeExposure: memeEngagement,
     // 1 token → 0, 12 → 1
     diversity: linNorm(metrics.distinctTokens30d, 1, 12),
+    profitability,
   };
 
   const score =
@@ -100,7 +128,8 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
       components.tradeSize * WEIGHTS.tradeSize +
       components.frequency * WEIGHTS.frequency +
       components.memeExposure * WEIGHTS.memeExposure +
-      components.diversity * WEIGHTS.diversity);
+      components.diversity * WEIGHTS.diversity +
+      components.profitability * WEIGHTS.profitability);
 
   const rounded = Number(score.toFixed(2));
   const reasons: string[] = [];
@@ -332,7 +361,14 @@ export async function evaluateWallet(
         tier: 'shrimp',
         qualifies: false,
         reasons: ['excluded: exchange / market maker / protocol account'],
-        components: { portfolio: 0, tradeSize: 0, frequency: 0, memeExposure: 0, diversity: 0 },
+        components: {
+          portfolio: 0,
+          tradeSize: 0,
+          frequency: 0,
+          memeExposure: 0,
+          diversity: 0,
+          profitability: 0,
+        },
       },
       whale: null,
       rejected: 'institutional account',
