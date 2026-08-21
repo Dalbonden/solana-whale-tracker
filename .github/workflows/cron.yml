@@ -5,38 +5,56 @@
 # so the scheduled work is triggered from here instead.
 #
 # ── Minute budget ──
-# GitHub Actions is unlimited on PUBLIC repos, but PRIVATE repos get 2,000
-# minutes/month and every run is billed as a minimum of one whole minute.
+# GitHub Actions is unlimited on PUBLIC repos; this one is public, which is why
+# the schedule runs every 15 minutes. PRIVATE repos get 2,000 minutes/month and
+# bill a minimum of one whole minute per run:
 #
 #     every 10 min → 4,320 runs/month → over budget
 #     every 15 min → 2,880 runs/month → over budget
 #     every 30 min → 1,440 runs/month → fits
 #
-# Hence: ONE job that fans out to several endpoints, on a 30-minute schedule.
-# If this repo is private, do not lower `cron` below */30.
+# If this repo is ever made private again, raise `cron` back to '*/30 * * * *'.
 #
-# If you want a tighter interval than 30 minutes — which also keeps the Render
-# instance from spinning down — use cron-job.org instead. It is free, unlimited,
-# and has no minute budget. See RENDER.md § Scheduling.
+# ── Why the clock gating ──
+# Heavy jobs are spread across the quarter-hour slots rather than firing
+# together. Portfolio snapshots take ~60s, discovery ~160s and trace deepening
+# up to 250s; running them in one invocation would stack toward the job timeout
+# and, with `cancel-in-progress: false`, start queueing runs behind each other.
+#
+# ── Why portfolios runs hourly ──
+# It is the only source of net-worth history, and /compounders needs at least
+# three snapshots spanning 24h before it can say anything about a wallet. Every
+# run adds one point to every wallet's curve, so the cadence here sets the
+# resolution of that whole feature.
 #
 # ── Setup ──
 # Repo → Settings → Secrets and variables → Actions:
 #   APP_URL      https://your-service.onrender.com
-#   CRON_SECRET  copy from Render → Environment
+#   CRON_SECRET  copy from Render → your service → Environment
+#                (Render generates its own; it is NOT the value in .env.local)
 # =============================================================================
 
 name: cron
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     inputs:
       job:
         description: 'Run a single job instead of the scheduled set'
         required: false
         type: choice
-        options: ['', sync, tokens, portfolios, discover, webhook-sync]
+        options:
+          - ''
+          - sync
+          - tokens
+          - portfolios
+          - discover
+          - webhook-sync
+          - backfill
+          - deepen-traces
+          - rebuild-positions
 
 permissions:
   contents: read
@@ -49,7 +67,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Trigger jobs
@@ -72,7 +90,7 @@ jobs:
             local name="$1" path="$2"
             echo "::group::$name"
 
-            # --max-time 600 covers a cold start (~50s) plus a long discovery run.
+            # --max-time 600 covers a cold start (~50s) plus a long job.
             local body status
             body=$(curl -sS --max-time 600 \
                         --retry 2 --retry-delay 15 --retry-connrefused \
@@ -84,8 +102,12 @@ jobs:
             printf '%s\n' "$body" | sed '$d'
 
             case "$status" in
-              2*) echo "→ $name ok ($status)" ;;
+              2*) echo "→ $name ok ($status)"
+                  echo "- \`$name\` ok" >> "$GITHUB_STEP_SUMMARY" ;;
+              401) echo "::error::$name rejected the CRON_SECRET. Copy it from Render → Environment; the value in .env.local is a different secret."
+                   FAILED=1 ;;
               *)  echo "::warning::$name returned ${status:-no response}"
+                  echo "- \`$name\` returned ${status:-no response}" >> "$GITHUB_STEP_SUMMARY"
                   FAILED=1 ;;
             esac
             echo "::endgroup::"
@@ -97,22 +119,45 @@ jobs:
             exit $FAILED
           fi
 
-          # Ingest runs on every invocation.
+          # Ingest runs on every invocation, and doubles as the keep-warm ping
+          # that stops the free Render instance spinning down.
           call sync /api/cron/sync
 
-          # Heavier jobs are gated on the clock so one billed minute does as
-          # much useful work as possible. $(date -u +%H) is zero-padded, so
-          # strip the leading zero to avoid octal parsing in arithmetic.
+          # $(date -u +%H) is zero-padded, so strip the leading zero to avoid
+          # octal parsing in arithmetic.
           HOUR=$((10#$(date -u +%H)))
           MINUTE=$((10#$(date -u +%M)))
 
-          # Only the run in the first half of the hour does hourly-plus work.
-          if [ "$MINUTE" -lt 30 ]; then
-            [ $((HOUR % 2)) -eq 0 ] && call tokens     /api/cron/tokens
-            [ $((HOUR % 3)) -eq 0 ] && call portfolios /api/cron/portfolios
-            [ $((HOUR % 6)) -eq 0 ] && call discover   /api/cron/discover
-            # Re-subscribe the webhook after discovery may have added whales.
-            [ $((HOUR % 6)) -eq 1 ] && call webhook-sync /api/cron/webhook-sync
+          if   [ "$MINUTE" -lt 15 ]; then SLOT=0
+          elif [ "$MINUTE" -lt 30 ]; then SLOT=1
+          elif [ "$MINUTE" -lt 45 ]; then SLOT=2
+          else                            SLOT=3
           fi
+
+          case "$SLOT" in
+            0)
+              # Hourly. Drives every net-worth trajectory on /compounders.
+              call portfolios /api/cron/portfolios
+              ;;
+            1)
+              # Hourly. Walks cached wallet histories further back, which is
+              # what turns the funding graph's per-request cap into a
+              # cumulative one.
+              call deepen-traces "/api/cron/deepen-traces?limit=10&pages=8"
+              ;;
+            2)
+              [ $((HOUR % 2)) -eq 0 ] && call tokens /api/cron/tokens
+              ;;
+            3)
+              [ $((HOUR % 6)) -eq 0 ] && call discover /api/cron/discover
+              # Re-subscribe the webhook after discovery may have added whales.
+              [ $((HOUR % 6)) -eq 1 ] && call webhook-sync /api/cron/webhook-sync
+              # Reach further back through whale history, recovering the cost
+              # basis that makes P&L computable.
+              [ $((HOUR % 6)) -eq 3 ] && call backfill "/api/cron/backfill?limit=5&max=400"
+              # Nightly repair: recompute the position ledger from trades.
+              [ "$HOUR" -eq 4 ] && call rebuild-positions /api/cron/rebuild-positions
+              ;;
+          esac
 
           exit $FAILED
