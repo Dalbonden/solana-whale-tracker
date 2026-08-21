@@ -31,6 +31,7 @@ const compile = spawnSync(
     'src/lib/core/positions.ts',
     'src/lib/core/archetypes.ts',
     'src/lib/core/wealth.ts',
+    'src/lib/db/paginate.ts',
     '--rootDir',
     'src/lib',
     '--outDir',

@@ -17,35 +17,8 @@ import type {
 } from '@/types';
 
 import { db } from './client';
-
-/**
- * Reads every matching row, not the first page of them.
- *
- * PostgREST silently caps an unbounded select at 1000 rows. That is a
- * particularly nasty default here because the truncation looks exactly like
- * missing data: a wallet with four days of snapshots comes back with one, and
- * every downstream calculation is confidently wrong about how much history
- * exists. Anything that can outgrow a thousand rows goes through this.
- */
-const PAGE_SIZE = 1000;
-
-export async function selectAllPages<T>(
-  label: string,
-  page: (from: number, to: number) => PromiseLike<{ data: unknown; error: { message: string } | null }>
-): Promise<T[]> {
-  const rows: T[] = [];
-
-  for (let from = 0; ; from += PAGE_SIZE) {
-    const { data, error } = await page(from, from + PAGE_SIZE - 1);
-    if (error) throw new Error(`${label}: ${error.message}`);
-
-    const batch = (data ?? []) as T[];
-    rows.push(...batch);
-    if (batch.length < PAGE_SIZE) break;
-  }
-
-  return rows;
-}
+export { selectAllPages } from './paginate';
+import { selectAllPages } from './paginate';
 
 // ---------------------------------------------------------------------------
 // Tokens
@@ -76,9 +49,10 @@ export async function getToken(mint: string): Promise<MemeToken | null> {
 
 /** Mints of every active token, used as the tracker's filter set. */
 export async function listActiveMints(): Promise<string[]> {
-  const { data, error } = await db().from('meme_tokens').select('mint').eq('is_active', true);
-  if (error) throw new Error(`listActiveMints: ${error.message}`);
-  return (data ?? []).map((row) => row.mint as string);
+  const rows = await selectAllPages<{ mint: string }>('listActiveMints', (from, to) =>
+    db().from('meme_tokens').select('mint').eq('is_active', true).range(from, to)
+  );
+  return rows.map((row) => row.mint);
 }
 
 export async function upsertTokens(tokens: Partial<MemeToken>[]): Promise<number> {
@@ -163,9 +137,10 @@ export async function upsertWhales(whales: Partial<Whale>[]): Promise<number> {
 
 /** Addresses already known, so discovery can skip re-scoring them. */
 export async function getKnownWhaleAddresses(): Promise<Set<string>> {
-  const { data, error } = await db().from('whales').select('address');
-  if (error) throw new Error(`getKnownWhaleAddresses: ${error.message}`);
-  return new Set((data ?? []).map((row) => row.address as string));
+  const rows = await selectAllPages<{ address: string }>('getKnownWhaleAddresses', (from, to) =>
+    db().from('whales').select('address').range(from, to)
+  );
+  return new Set(rows.map((row) => row.address));
 }
 
 /** Whales due for a sync, oldest cursor first. */
@@ -232,14 +207,21 @@ export async function getWhalesToBackfill(limit: number): Promise<Whale[]> {
 
 /** Every address the Helius webhook should be subscribed to. */
 export async function getTrackedAddresses(): Promise<string[]> {
-  const { data, error } = await db()
-    .from('whales')
-    .select('address')
-    .eq('is_tracked', true)
-    .order('score', { ascending: false })
-    .limit(10_000);
-  if (error) throw new Error(`getTrackedAddresses: ${error.message}`);
-  return (data ?? []).map((row) => row.address as string);
+  /*
+   * `.limit(10_000)` looked like it covered this and did not: the server caps
+   * every response at 1000 rows whatever the client asks for, so a roster
+   * larger than that would silently drop the tail — and the tail is the
+   * lowest-scoring whales, which is exactly who a size-ranked list ends with.
+   */
+  const rows = await selectAllPages<{ address: string }>('getTrackedAddresses', (from, to) =>
+    db()
+      .from('whales')
+      .select('address')
+      .eq('is_tracked', true)
+      .order('score', { ascending: false })
+      .range(from, to)
+  );
+  return rows.map((row) => row.address);
 }
 
 // ---------------------------------------------------------------------------
@@ -327,55 +309,6 @@ export async function updateTradeClassifications(trades: Partial<WhaleTrade>[]):
   return written;
 }
 
-/** Prior trades for a whale/token pair — the basis for position tracking. */
-export async function getPositionHistory(
-  whale: string,
-  mint: string
-): Promise<{
-  boughtAmount: number;
-  soldAmount: number;
-  boughtUsd: number;
-  soldUsd: number;
-  tradeCount: number;
-  /** Average USD cost per token across observed buys, or null if none seen. */
-  avgCostUsd: number | null;
-}> {
-  const { data, error } = await db()
-    .from('whale_trades')
-    .select('side, token_amount, usd_value')
-    .eq('whale_address', whale)
-    .eq('token_mint', mint);
-  if (error) throw new Error(`getPositionHistory: ${error.message}`);
-
-  let boughtAmount = 0;
-  let soldAmount = 0;
-  let boughtUsd = 0;
-  let soldUsd = 0;
-
-  for (const row of data ?? []) {
-    const amount = Number(row.token_amount) || 0;
-    const usd = Number(row.usd_value) || 0;
-    if (row.side === 'buy') {
-      boughtAmount += amount;
-      boughtUsd += usd;
-    } else {
-      soldAmount += amount;
-      soldUsd += usd;
-    }
-  }
-
-  return {
-    boughtAmount,
-    soldAmount,
-    boughtUsd,
-    soldUsd,
-    tradeCount: (data ?? []).length,
-    // Average cost basis. Null when we never observed a buy — the position was
-    // opened before tracking began, so its basis is genuinely unknown.
-    avgCostUsd: boughtAmount > 0 && boughtUsd > 0 ? boughtUsd / boughtAmount : null,
-  };
-}
-
 /** 30-day activity stats used by the scorer. */
 export async function getWhaleActivityStats(address: string): Promise<{
   tradeCount: number;
@@ -385,14 +318,20 @@ export async function getWhaleActivityStats(address: string): Promise<{
   lastActiveAt: Date | null;
 }> {
   const since = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
-  const { data, error } = await db()
-    .from('whale_trades')
-    .select('usd_value, token_mint, block_time')
-    .eq('whale_address', address)
-    .gte('block_time', since);
-  if (error) throw new Error(`getWhaleActivityStats: ${error.message}`);
+  // Paged: an active whale trades well past a thousand times a month, and a
+  // truncated read here understates trade count, mean and maximum size — all
+  // three of which feed the whale score.
+  const rows = await selectAllPages<{ usd_value: number; token_mint: string; block_time: string }>(
+    'getWhaleActivityStats',
+    (from, to) =>
+      db()
+        .from('whale_trades')
+        .select('usd_value, token_mint, block_time')
+        .eq('whale_address', address)
+        .gte('block_time', since)
+        .range(from, to)
+  );
 
-  const rows = data ?? [];
   if (!rows.length) {
     return { tradeCount: 0, avgUsd: 0, maxUsd: 0, distinctTokens: 0, lastActiveAt: null };
   }
@@ -423,14 +362,16 @@ export async function getWhaleActivityStats(address: string): Promise<{
 /** Distinct whales that bought a token inside a window (cluster detection). */
 export async function countDistinctBuyers(mint: string, windowMinutes: number): Promise<string[]> {
   const since = new Date(Date.now() - windowMinutes * 60_000).toISOString();
-  const { data, error } = await db()
-    .from('whale_trades')
-    .select('whale_address')
-    .eq('token_mint', mint)
-    .eq('side', 'buy')
-    .gte('block_time', since);
-  if (error) throw new Error(`countDistinctBuyers: ${error.message}`);
-  return [...new Set((data ?? []).map((row) => row.whale_address as string))];
+  const rows = await selectAllPages<{ whale_address: string }>('countDistinctBuyers', (from, to) =>
+    db()
+      .from('whale_trades')
+      .select('whale_address')
+      .eq('token_mint', mint)
+      .eq('side', 'buy')
+      .gte('block_time', since)
+      .range(from, to)
+  );
+  return [...new Set(rows.map((row) => row.whale_address))];
 }
 
 /** Tokens a whale fully exited inside a window (rotation detection). */
@@ -439,15 +380,18 @@ export async function getRecentExits(
   windowMinutes: number
 ): Promise<Array<{ token_mint: string; token_symbol: string | null; block_time: string }>> {
   const since = new Date(Date.now() - windowMinutes * 60_000).toISOString();
-  const { data, error } = await db()
-    .from('whale_trades')
-    .select('token_mint, token_symbol, block_time')
-    .eq('whale_address', whale)
-    .eq('is_full_exit', true)
-    .gte('block_time', since)
-    .order('block_time', { ascending: false });
-  if (error) throw new Error(`getRecentExits: ${error.message}`);
-  return (data ?? []) as Array<{ token_mint: string; token_symbol: string | null; block_time: string }>;
+  return selectAllPages<{ token_mint: string; token_symbol: string | null; block_time: string }>(
+    'getRecentExits',
+    (from, to) =>
+      db()
+        .from('whale_trades')
+        .select('token_mint, token_symbol, block_time')
+        .eq('whale_address', whale)
+        .eq('is_full_exit', true)
+        .gte('block_time', since)
+        .order('block_time', { ascending: false })
+        .range(from, to)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -479,15 +423,19 @@ export async function filterNewTrades<T extends Partial<WhaleTrade>>(rows: T[]):
   const signatures = [...new Set(rows.map((r) => r.signature as string))];
   const seen = new Set<string>();
 
+  // Paged, because a truncated read here is worse than a slow one: a trade that
+  // looks new when it is not gets applied to the position a second time.
   for (const batch of chunk(signatures, 200)) {
-    const { data, error } = await db()
-      .from('whale_trades')
-      .select('signature, whale_address, token_mint, side')
-      .in('signature', batch);
-    if (error) throw new Error(`filterNewTrades: ${error.message}`);
-    for (const row of data ?? []) {
-      seen.add(tradeKey(row as Parameters<typeof tradeKey>[0]));
-    }
+    const rows2 = await selectAllPages<Parameters<typeof tradeKey>[0]>(
+      'filterNewTrades',
+      (from, to) =>
+        db()
+          .from('whale_trades')
+          .select('signature, whale_address, token_mint, side')
+          .in('signature', batch)
+          .range(from, to)
+    );
+    for (const row of rows2) seen.add(tradeKey(row));
   }
 
   return rows.filter((row) => !seen.has(tradeKey(row as Parameters<typeof tradeKey>[0])));
@@ -507,14 +455,16 @@ export async function getOpenPositions(
   // in memory. One round trip beats one query per pair, and the open-position
   // set per whale is small.
   for (const batch of chunk(whales, 50)) {
-    const { data, error } = await db()
-      .from('whale_positions')
-      .select('*')
-      .in('whale_address', batch)
-      .in('token_mint', mints)
-      .eq('status', 'open');
-    if (error) throw new Error(`getOpenPositions: ${error.message}`);
-    for (const row of (data ?? []) as WhalePosition[]) {
+    const rows = await selectAllPages<WhalePosition>('getOpenPositions', (from, to) =>
+      db()
+        .from('whale_positions')
+        .select('*')
+        .in('whale_address', batch)
+        .in('token_mint', mints)
+        .eq('status', 'open')
+        .range(from, to)
+    );
+    for (const row of rows) {
       found.set(`${row.whale_address}:${row.token_mint}`, row);
     }
   }
@@ -539,14 +489,14 @@ export async function listPositions(
   whale: string,
   opts: { status?: 'open' | 'closed' } = {}
 ): Promise<WhalePosition[]> {
-  let query = db().from('whale_positions').select('*').eq('whale_address', whale);
-  if (opts.status) query = query.eq('status', opts.status);
-
-  const { data, error } = await query
-    .order('status', { ascending: true })
-    .order('last_trade_at', { ascending: false });
-  if (error) throw new Error(`listPositions: ${error.message}`);
-  return (data ?? []) as WhalePosition[];
+  return selectAllPages<WhalePosition>('listPositions', (from, to) => {
+    let query = db().from('whale_positions').select('*').eq('whale_address', whale);
+    if (opts.status) query = query.eq('status', opts.status);
+    return query
+      .order('status', { ascending: true })
+      .order('last_trade_at', { ascending: false })
+      .range(from, to);
+  });
 }
 
 /** Cached prices for a set of mints, for marking positions to market. */
@@ -554,6 +504,8 @@ export async function getTokenPrices(mints: string[]): Promise<Map<string, numbe
   const prices = new Map<string, number | null>();
   if (!mints.length) return prices;
 
+  // Bounded by construction: `mint` is the primary key and batches are 200, so
+  // a page can never approach the 1000-row cap.
   for (const batch of chunk([...new Set(mints)], 200)) {
     const { data, error } = await db()
       .from('meme_tokens')
@@ -616,13 +568,14 @@ export async function insertPortfolioSnapshot(
 }
 
 export async function getCurrentPortfolio(whale: string): Promise<PortfolioHolding[]> {
-  const { data, error } = await db()
-    .from('whale_portfolio_current')
-    .select('*')
-    .eq('whale_address', whale)
-    .order('usd_value', { ascending: false });
-  if (error) throw new Error(`getCurrentPortfolio: ${error.message}`);
-  return (data ?? []) as PortfolioHolding[];
+  return selectAllPages<PortfolioHolding>('getCurrentPortfolio', (from, to) =>
+    db()
+      .from('whale_portfolio_current')
+      .select('*')
+      .eq('whale_address', whale)
+      .order('usd_value', { ascending: false })
+      .range(from, to)
+  );
 }
 
 /**
@@ -691,13 +644,24 @@ export async function getPortfolioTimeline(
   days = 30
 ): Promise<Array<{ snapshot_at: string; total_usd: number; meme_usd: number }>> {
   const since = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
-  const { data, error } = await db()
-    .from('whale_portfolios')
-    .select('snapshot_at, usd_value, is_meme')
-    .eq('whale_address', whale)
-    .gte('snapshot_at', since)
-    .order('snapshot_at', { ascending: true });
-  if (error) throw new Error(`getPortfolioTimeline: ${error.message}`);
+  /*
+   * Paged, and the most urgent of these: snapshots are one row per holding, so
+   * a whale with 156 tokens generates 156 rows an hour. The largest was already
+   * at 485 rows across 30 days when snapshots ran occasionally; on the hourly
+   * schedule it crosses a thousand within a day, and a truncated read silently
+   * lops the oldest part off the portfolio chart.
+   */
+  const data = await selectAllPages<{ snapshot_at: string; usd_value: number; is_meme: boolean }>(
+    'getPortfolioTimeline',
+    (from, to) =>
+      db()
+        .from('whale_portfolios')
+        .select('snapshot_at, usd_value, is_meme')
+        .eq('whale_address', whale)
+        .gte('snapshot_at', since)
+        .order('snapshot_at', { ascending: true })
+        .range(from, to)
+  );
 
   const buckets = new Map<string, { total: number; meme: number }>();
   for (const row of data ?? []) {

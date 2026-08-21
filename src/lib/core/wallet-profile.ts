@@ -194,12 +194,12 @@ async function fetchTrades(
 async function fetchVelocity(addresses: string[]): Promise<Map<string, number>> {
   const velocity = new Map<string, number>();
   try {
-    const { data, error } = await db()
-      .from('wallet_traces')
-      .select('address, tx_per_hour')
-      .in('address', addresses);
-    if (error) throw new Error(error.message);
-    for (const row of data ?? []) {
+    const data = await selectAllPages<{ address: string; tx_per_hour: number | null }>(
+      'fetchVelocity',
+      (from, to) =>
+        db().from('wallet_traces').select('address, tx_per_hour').in('address', addresses).range(from, to)
+    );
+    for (const row of data) {
       if (row.tx_per_hour !== null) velocity.set(row.address as string, Number(row.tx_per_hour));
     }
   } catch {
@@ -210,14 +210,16 @@ async function fetchVelocity(addresses: string[]): Promise<Map<string, number>> 
 
 async function fetchSnipeCounts(addresses: string[]): Promise<Map<string, number>> {
   const counts = new Map<string, number>();
-  const { data, error } = await db()
-    .from('alerts')
-    .select('whale_address')
-    .eq('type', 'pumpfun_snipe')
-    .in('whale_address', addresses);
-  if (error) throw new Error(`fetchSnipeCounts: ${error.message}`);
+  const data = await selectAllPages<{ whale_address: string }>('fetchSnipeCounts', (from, to) =>
+    db()
+      .from('alerts')
+      .select('whale_address')
+      .eq('type', 'pumpfun_snipe')
+      .in('whale_address', addresses)
+      .range(from, to)
+  );
 
-  for (const row of data ?? []) {
+  for (const row of data) {
     const address = row.whale_address as string;
     counts.set(address, (counts.get(address) ?? 0) + 1);
   }
@@ -226,9 +228,11 @@ async function fetchSnipeCounts(addresses: string[]): Promise<Map<string, number
 
 async function fetchPrices(): Promise<Map<string, number | null>> {
   const prices = new Map<string, number | null>();
-  const { data, error } = await db().from('meme_tokens').select('mint, price_usd');
-  if (error) throw new Error(`fetchPrices: ${error.message}`);
-  for (const row of data ?? []) {
+  const data = await selectAllPages<{ mint: string; price_usd: number | null }>(
+    'fetchPrices',
+    (from, to) => db().from('meme_tokens').select('mint, price_usd').range(from, to)
+  );
+  for (const row of data) {
     prices.set(row.mint as string, row.price_usd === null ? null : Number(row.price_usd));
   }
   return prices;

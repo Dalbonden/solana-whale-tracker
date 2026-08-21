@@ -160,6 +160,8 @@ export async function loadTraces(
   if (!addresses.length || !counter.cacheAvailable) return found;
 
   try {
+    // Bounded by construction: `address` is the primary key and callers pass at
+    // most MAX_TRACED_CANDIDATES addresses, so this cannot hit the row cap.
     const { data, error } = await db()
       .from('wallet_traces')
       .select('*')
