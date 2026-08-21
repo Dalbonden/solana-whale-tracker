@@ -1,6 +1,6 @@
 'use client';
 
-import { Activity, Bell, Coins, LayoutDashboard, Search, Waves } from 'lucide-react';
+import { Activity, Bell, Coins, LayoutDashboard, Search, TrendingUp, Waves } from 'lucide-react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 
@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils';
 const LINKS = [
   { href: '/', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/whales', label: 'Whales', icon: Waves },
+  { href: '/compounders', label: 'Compounders', icon: TrendingUp },
   { href: '/tokens', label: 'Tokens', icon: Coins },
   { href: '/activity', label: 'Activity', icon: Activity },
   { href: '/alerts', label: 'Alerts', icon: Bell },

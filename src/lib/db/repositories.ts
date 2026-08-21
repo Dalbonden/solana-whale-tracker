@@ -18,6 +18,35 @@ import type {
 
 import { db } from './client';
 
+/**
+ * Reads every matching row, not the first page of them.
+ *
+ * PostgREST silently caps an unbounded select at 1000 rows. That is a
+ * particularly nasty default here because the truncation looks exactly like
+ * missing data: a wallet with four days of snapshots comes back with one, and
+ * every downstream calculation is confidently wrong about how much history
+ * exists. Anything that can outgrow a thousand rows goes through this.
+ */
+const PAGE_SIZE = 1000;
+
+export async function selectAllPages<T>(
+  label: string,
+  page: (from: number, to: number) => PromiseLike<{ data: unknown; error: { message: string } | null }>
+): Promise<T[]> {
+  const rows: T[] = [];
+
+  for (let from = 0; ; from += PAGE_SIZE) {
+    const { data, error } = await page(from, from + PAGE_SIZE - 1);
+    if (error) throw new Error(`${label}: ${error.message}`);
+
+    const batch = (data ?? []) as T[];
+    rows.push(...batch);
+    if (batch.length < PAGE_SIZE) break;
+  }
+
+  return rows;
+}
+
 // ---------------------------------------------------------------------------
 // Tokens
 // ---------------------------------------------------------------------------
@@ -594,6 +623,66 @@ export async function getCurrentPortfolio(whale: string): Promise<PortfolioHoldi
     .order('usd_value', { ascending: false });
   if (error) throw new Error(`getCurrentPortfolio: ${error.message}`);
   return (data ?? []) as PortfolioHolding[];
+}
+
+/**
+ * Portfolio value per snapshot for many whales at once.
+ *
+ * One query rather than one per wallet: the compounders board reads every
+ * tracked whale, and per-wallet timelines turned that into N round trips.
+ *
+ * Paged explicitly. PostgREST caps an unbounded select at 1000 rows and returns
+ * them without complaint, which silently truncated every wallet's history —
+ * 2747 snapshot rows arrived as 1000, and the trajectory code correctly but
+ * uselessly reported that nobody had enough data. Snapshots are one row per
+ * holding, so this table outgrows that cap almost immediately.
+ */
+export async function getPortfolioTimelines(
+  addresses: string[],
+  days = 30
+): Promise<Map<string, Array<{ at: number; totalUsd: number }>>> {
+  const result = new Map<string, Array<{ at: number; totalUsd: number }>>();
+  if (!addresses.length) return result;
+
+  const since = new Date(Date.now() - days * 24 * 3600_000).toISOString();
+
+  for (const batch of chunk(addresses, 50)) {
+    const data = await selectAllPages<{
+      whale_address: string;
+      snapshot_at: string;
+      usd_value: number;
+    }>('getPortfolioTimelines', (from, to) =>
+      db()
+        .from('whale_portfolios')
+        .select('whale_address, snapshot_at, usd_value')
+        .in('whale_address', batch)
+        .gte('snapshot_at', since)
+        .order('snapshot_at', { ascending: true })
+        .range(from, to)
+    );
+
+    // Holdings are stored one row per token, so a snapshot is the sum of its
+    // rows rather than a row of its own.
+    const totals = new Map<string, Map<string, number>>();
+    for (const row of data ?? []) {
+      const address = row.whale_address as string;
+      const at = row.snapshot_at as string;
+      const perSnapshot = totals.get(address) ?? new Map<string, number>();
+      perSnapshot.set(at, (perSnapshot.get(at) ?? 0) + (Number(row.usd_value) || 0));
+      totals.set(address, perSnapshot);
+    }
+
+    for (const [address, perSnapshot] of totals) {
+      result.set(
+        address,
+        [...perSnapshot.entries()]
+          .map(([at, totalUsd]) => ({ at: Date.parse(at) / 1000, totalUsd }))
+          .sort((a, b) => a.at - b.at)
+      );
+    }
+  }
+
+  return result;
 }
 
 /** Total portfolio value per snapshot, for the value-over-time chart. */

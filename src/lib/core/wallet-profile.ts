@@ -9,6 +9,7 @@
  */
 
 import { db } from '@/lib/db/client';
+import { selectAllPages } from '@/lib/db/repositories';
 import type { Whale, WhalePosition } from '@/types';
 
 import {
@@ -152,13 +153,13 @@ export async function buildArchetypeMetrics(
 
 async function fetchPositions(addresses: string[]): Promise<Map<string, WhalePosition[]>> {
   const byWhale = new Map<string, WhalePosition[]>();
-  const { data, error } = await db()
-    .from('whale_positions')
-    .select('*')
-    .in('whale_address', addresses);
-  if (error) throw new Error(`fetchPositions: ${error.message}`);
+  // Paged: PostgREST truncates an unbounded select at 1000 rows without saying
+  // so, and position rows accumulate one per entry-to-exit cycle per wallet.
+  const data = await selectAllPages<WhalePosition>('fetchPositions', (from, to) =>
+    db().from('whale_positions').select('*').in('whale_address', addresses).range(from, to)
+  );
 
-  for (const row of (data ?? []) as WhalePosition[]) {
+  for (const row of data) {
     byWhale.set(row.whale_address, [...(byWhale.get(row.whale_address) ?? []), row]);
   }
   return byWhale;
@@ -169,14 +170,16 @@ async function fetchTrades(
   since: string
 ): Promise<Map<string, TradeStatRow[]>> {
   const byWhale = new Map<string, TradeStatRow[]>();
-  const { data, error } = await db()
-    .from('whale_trades')
-    .select('whale_address, side, usd_value, realized_pnl_usd, realized_pnl_pct, block_time, token_mint')
-    .in('whale_address', addresses)
-    .gte('block_time', since);
-  if (error) throw new Error(`fetchTrades: ${error.message}`);
+  const data = await selectAllPages<TradeStatRow>('fetchTrades', (from, to) =>
+    db()
+      .from('whale_trades')
+      .select('whale_address, side, usd_value, realized_pnl_usd, realized_pnl_pct, block_time, token_mint')
+      .in('whale_address', addresses)
+      .gte('block_time', since)
+      .range(from, to)
+  );
 
-  for (const row of (data ?? []) as TradeStatRow[]) {
+  for (const row of data) {
     byWhale.set(row.whale_address, [...(byWhale.get(row.whale_address) ?? []), row]);
   }
   return byWhale;
