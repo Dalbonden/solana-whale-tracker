@@ -22,8 +22,8 @@ import {
   upsertPositions,
   upsertWhales,
 } from '@/lib/db/repositories';
-import * as birdeye from '@/lib/providers/birdeye';
 import * as helius from '@/lib/providers/helius';
+import * as pricing from '@/lib/providers/pricing';
 import type { HeliusEnhancedTransaction } from '@/lib/providers/helius';
 import { QUOTE_MINTS } from '@/lib/solana/constants';
 import {
@@ -84,7 +84,9 @@ export async function persistSwaps(swaps: ParsedSwap[]): Promise<IngestResult> {
     return { parsed: 0, stored: 0, alerts: 0, latestSignature: null, latestBlockTime: null };
   }
 
-  const prices = await birdeye.getPrices(mintsToPrice(swaps));
+  // Short list, and every mint here values a trade a user will read, so all
+  // of them are worth the Birdeye fallback when Jupiter has no quote.
+  const prices = await pricing.getPrices(mintsToPrice(swaps));
 
   // Chronological order is what makes the new-position / full-exit flags
   // correct: each trade is classified against the position the earlier ones

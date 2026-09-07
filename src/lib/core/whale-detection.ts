@@ -20,6 +20,7 @@ import { config } from '@/lib/config';
 import { getWhaleActivityStats } from '@/lib/db/repositories';
 import * as birdeye from '@/lib/providers/birdeye';
 import * as helius from '@/lib/providers/helius';
+import * as pricing from '@/lib/providers/pricing';
 import * as solscan from '@/lib/providers/solscan';
 import { NATIVE_SOL, NON_MEME_MINTS } from '@/lib/solana/constants';
 import type { WalletMetrics, Whale, WhaleScore, WhaleTier } from '@/types';
@@ -179,9 +180,10 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
 /**
  * Values a wallet's holdings and splits them into meme vs non-meme.
  *
- * Prefers Birdeye's priced wallet endpoint (one call, includes USD values) and
- * falls back to RPC balances + a batch price lookup when Birdeye is unavailable
- * or returns nothing.
+ * Inventory comes from RPC balances; pricing goes through `pricing`, which
+ * quotes Jupiter first and falls back to Birdeye only for critical mints.
+ * Birdeye's own priced wallet endpoint is not used — it is plan-gated on this
+ * key and returns 401.
  */
 export interface Holding {
   mint: string;
@@ -213,11 +215,15 @@ export async function collectPortfolioMetrics(address: string): Promise<{
    * per-mint Birdeye calls would take minutes on a free key, which is exactly
    * what made discovery time out earlier.
    *
-   * Birdeye is still consulted, but only for the mints that must be accurate —
-   * SOL, stables and tracked meme tokens — since those drive the score and the
-   * trade valuations. DAS prices cover the long tail.
+   * Pricing now goes through `pricing`, which quotes 100 mints per keyless
+   * Jupiter call. That is cheap enough to price the *whole* inventory rather
+   * than a hand-picked subset, so the long tail no longer depends on whatever
+   * DAS happens to carry. Birdeye is still the fallback, but only for the mints
+   * that drive the score and the trade valuations — SOL, stables and tracked
+   * meme tokens — because its budget is metered and, once spent, takes every
+   * other Birdeye endpoint down with it.
    *
-   * Positions DAS cannot price are still recorded, with `unpriced: true` and a
+   * Positions nothing can price are still recorded, with `unpriced: true` and a
    * zero value. They are inventory the wallet genuinely holds; omitting them
    * would misrepresent the portfolio as smaller than it is.
    */
@@ -229,12 +235,17 @@ export async function collectPortfolioMetrics(address: string): Promise<{
   const allMints = balances.map((balance) => balance.mint);
   const metadata = await helius.getAssetsBatch(allMints);
 
-  // Accurate pricing only where it matters; DAS covers everything else.
-  const priorityMints = allMints.filter(
+  // Everything gets a Jupiter quote; only these are worth Birdeye's metered
+  // budget when Jupiter has none.
+  const criticalMints = allMints.filter(
     (mint) => memeMints.has(mint) || NON_MEME_MINTS.has(mint)
   );
-  if (solBalance > 0) priorityMints.push(NATIVE_SOL);
-  const prices = await birdeye.getPrices(priorityMints);
+  const mintsToPrice = [...allMints];
+  if (solBalance > 0) {
+    criticalMints.push(NATIVE_SOL);
+    mintsToPrice.push(NATIVE_SOL);
+  }
+  const prices = await pricing.getPrices(mintsToPrice, { critical: criticalMints });
 
   const priceFor = (mint: string): number | null =>
     prices.get(mint) ?? metadata.get(mint)?.priceUsd ?? null;
