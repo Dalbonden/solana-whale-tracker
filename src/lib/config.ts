@@ -77,6 +77,16 @@ export const config = {
     },
   },
 
+  /**
+   * Jupiter needs no key, so there is nothing to enable — the default host is
+   * the free `lite-api` tier. `JUPITER_API_URL` exists so a paid plan (which
+   * serves the same paths under a different host) can be swapped in without a
+   * code change.
+   */
+  jupiter: {
+    baseUrl: optional('JUPITER_API_URL', 'https://lite-api.jup.ag'),
+  },
+
   solscan: {
     apiKey: optional('SOLSCAN_API_KEY'),
     baseUrl: 'https://pro-api.solscan.io/v2.0',

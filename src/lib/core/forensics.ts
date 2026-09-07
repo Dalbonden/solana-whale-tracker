@@ -108,13 +108,19 @@ export interface ForensicsReport {
   deployer: {
     address: string | null;
     /** Which source identified it, so the reader can weigh the claim. */
-    via: 'update_authority' | 'mint_creation' | null;
+    via: 'update_authority' | 'mint_creation' | 'token_metadata' | null;
     note: string | null;
     /** Deployer appears among the largest holders. */
     stillHolding: boolean | null;
     pctOfSupply: number | null;
     /** Counterparties found while scanning the deployer's transactions. */
     counterpartiesScanned: number;
+    /**
+     * Other tokens this wallet has launched, when the index reports it. A
+     * serial deployer is a different kind of subject from a first-timer, but
+     * the count alone says nothing about how any of those launches went.
+     */
+    otherLaunches: number | null;
   };
   mintAuthorityActive: boolean;
   freezeAuthorityActive: boolean;
@@ -182,6 +188,7 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
       stillHolding: null,
       pctOfSupply: null,
       counterpartiesScanned: 0,
+      otherLaunches: null,
     },
     mintAuthorityActive: Boolean(mintInfo?.mintAuthority),
     freezeAuthorityActive: Boolean(mintInfo?.freezeAuthority),
@@ -221,7 +228,7 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
     updateAuthority && authorityEntity && authorityEntity.kind === 'unidentified'
       ? updateAuthority
       : null;
-  let deployerVia: 'update_authority' | 'mint_creation' | null = deployer
+  let deployerVia: 'update_authority' | 'mint_creation' | 'token_metadata' | null = deployer
     ? 'update_authority'
     : null;
 
@@ -231,10 +238,12 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
     const creator = await findMintCreator(mint, walkCounter).catch(() => ({
       address: null,
       via: null as null,
+      devMints: null,
     }));
     if (creator.address) {
       deployer = creator.address;
-      deployerVia = 'mint_creation';
+      deployerVia = creator.via;
+      report.deployer.otherLaunches = creator.devMints;
     }
   }
 
@@ -248,6 +257,10 @@ export async function analyseLaunch(mint: string): Promise<ForensicsReport> {
   } else if (deployerVia === 'mint_creation') {
     limitations.push(
       'The deployer was identified as the wallet that paid to create the mint. That is who funded the creation, which is usually but not always the same person as the operator.'
+    );
+  } else if (deployerVia === 'token_metadata') {
+    limitations.push(
+      'The deployer was taken from a third-party token index rather than derived from the chain here. It matches the creating wallet in every case checked, but it is a reported value, not one this report verified.'
     );
   }
 

@@ -81,7 +81,8 @@ interface Report {
   launchAt: string | null;
   deployer: {
     address: string | null;
-    via: 'update_authority' | 'mint_creation' | null;
+    via: 'update_authority' | 'mint_creation' | 'token_metadata' | null;
+    otherLaunches: number | null;
     note: string | null;
     stillHolding: boolean | null;
     pctOfSupply: number | null;
@@ -298,11 +299,20 @@ function Result({ report }: { report: Report }) {
                 Funded {report.deployer.counterpartiesScanned} wallets in the history scanned;{' '}
                 {report.funding.hopWalletsExpanded} of those were followed one hop further.
               </p>
+              {report.deployer.otherLaunches !== null && (
+                <p className="text-muted-foreground">
+                  This wallet has launched {report.deployer.otherLaunches}{' '}
+                  {report.deployer.otherLaunches === 1 ? 'token' : 'tokens'} in total. The count
+                  alone says nothing about how those launches performed.
+                </p>
+              )}
               <p className="text-muted-foreground">
                 Identified from{' '}
                 {report.deployer.via === 'mint_creation'
                   ? 'the wallet that paid to create the mint'
-                  : 'the token metadata update authority'}
+                  : report.deployer.via === 'token_metadata'
+                    ? 'a third-party token index'
+                    : 'the token metadata update authority'}
                 .
               </p>
             </div>

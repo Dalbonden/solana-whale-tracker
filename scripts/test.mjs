@@ -32,6 +32,7 @@ const compile = spawnSync(
     'src/lib/core/archetypes.ts',
     'src/lib/core/wealth.ts',
     'src/lib/db/paginate.ts',
+    'src/lib/providers/batch.ts',
     '--rootDir',
     'src/lib',
     '--outDir',

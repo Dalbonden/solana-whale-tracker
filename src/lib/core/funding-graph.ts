@@ -43,6 +43,7 @@
  */
 
 import { mapWithConcurrency } from '@/lib/providers/http';
+import * as jupiter from '@/lib/providers/jupiter';
 import { identifyAddress, isNonDiscretionaryHolder } from '@/lib/solana/entities';
 
 import {
@@ -74,6 +75,14 @@ export const MAX_TRACED_CANDIDATES = 10;
  * The cache is what keeps that affordable: most visits do no network work.
  */
 const TRACE_CONCURRENCY = 1;
+
+/** How a deployer was identified, and what the source could tell us about them. */
+export interface MintCreator {
+  address: string | null;
+  via: 'mint_creation' | 'token_metadata' | null;
+  /** Tokens this deployer has launched. Only the indexed path knows this. */
+  devMints: number | null;
+}
 
 export type LinkKind = 'direct' | 'one_hop' | 'funded_by_deployer_peer';
 
@@ -132,16 +141,34 @@ export interface FundingGraph {
 export async function findMintCreator(
   mint: string,
   counter: WalkCounter
-): Promise<{ address: string | null; via: 'mint_creation' | null }> {
+): Promise<MintCreator> {
+  /*
+   * Jupiter indexes the deployer directly, so ask before paying for the walk.
+   * The walk below pages a mint's history back to its genesis transaction —
+   * several requests, and MINT_PAGES deep it still often comes back
+   * unconfirmed. One keyless call answers the same question, and was verified
+   * against tokens as obscure as a dead pump.fun mint with ten holders.
+   *
+   * It also returns `devMints`, which the walk cannot: how many other tokens
+   * this deployer has launched. A serial deployer is a materially different
+   * finding from a first-timer, so it is carried through to the report.
+   */
+  const indexed = await jupiter.getMintCreator(mint).catch(() => null);
+  if (indexed && identifyAddress(indexed.address).kind === 'unidentified') {
+    return { address: indexed.address, via: 'token_metadata', devMints: indexed.devMints };
+  }
+
   const trace = await ensureTrace(mint, MINT_PAGES, counter);
-  if (!trace.originConfirmed || !trace.genesisFeePayer) return { address: null, via: null };
+  if (!trace.originConfirmed || !trace.genesisFeePayer) {
+    return { address: null, via: null, devMints: null };
+  }
 
   // A launchpad paying the fee is the platform, not the person.
   if (identifyAddress(trace.genesisFeePayer).kind !== 'unidentified') {
-    return { address: null, via: null };
+    return { address: null, via: null, devMints: null };
   }
 
-  return { address: trace.genesisFeePayer, via: 'mint_creation' };
+  return { address: trace.genesisFeePayer, via: 'mint_creation', devMints: null };
 }
 
 /**
