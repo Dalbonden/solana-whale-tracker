@@ -1,7 +1,7 @@
 import { fail, ok, timingSafeEqual } from '@/lib/api';
 import { config } from '@/lib/config';
 import { ingestTransactions } from '@/lib/core/whale-tracker';
-import { getTrackedAddresses, recordJobRun } from '@/lib/db/repositories';
+import { getTrackedAddressesCached, recordJobRun } from '@/lib/db/repositories';
 import type { HeliusEnhancedTransaction } from '@/lib/providers/helius';
 
 export const dynamic = 'force-dynamic';
@@ -58,17 +58,28 @@ export async function POST(request: Request) {
   }
 
   try {
-    const tracked = new Set(await getTrackedAddresses());
+    const tracked = new Set(await getTrackedAddressesCached());
     const result = await ingestTransactions(valid, tracked);
 
-    await recordJobRun({
-      job: 'webhook.helius',
-      status: 'ok',
-      durationMs: Date.now() - started,
-      processed: valid.length,
-      created: result.stored,
-      detail: { parsed: result.parsed, alerts: result.alerts },
-    });
+    /*
+     * Only record deliveries that did something.
+     *
+     * Every delivery used to write a `job_runs` row, and the table had grown to
+     * 333,719 of them — almost all `{"parsed":0,"alerts":0}`. That is a write
+     * per push on the free database tier, and it buries the runs that matter:
+     * finding the eight cron entries meant paging through a third of a million
+     * no-ops. A delivery that parsed nothing is not an event worth keeping.
+     */
+    if (result.parsed > 0 || result.stored > 0 || result.alerts > 0) {
+      await recordJobRun({
+        job: 'webhook.helius',
+        status: 'ok',
+        durationMs: Date.now() - started,
+        processed: valid.length,
+        created: result.stored,
+        detail: { parsed: result.parsed, alerts: result.alerts },
+      });
+    }
 
     return ok({
       received: transactions.length,

@@ -33,6 +33,8 @@ const compile = spawnSync(
     'src/lib/core/wealth.ts',
     'src/lib/db/paginate.ts',
     'src/lib/providers/batch.ts',
+    'src/lib/providers/budget.ts',
+    'src/lib/core/sync-cadence.ts',
     '--rootDir',
     'src/lib',
     '--outDir',

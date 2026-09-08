@@ -49,14 +49,28 @@ interface ScheduledJob {
  * `sync` is the most frequent because it is the only thing that notices a whale
  * trading at all, and it doubles as the keep-warm request.
  */
+/*
+ * Cadence is set by what each job costs on a free API allowance, not by how
+ * often fresh data would be nice to have.
+ *
+ * The original intervals assumed the providers were effectively free. They are
+ * not: a month of this schedule exhausted both the Helius credit allowance and
+ * Birdeye's compute units, at which point every job fails and the tracker
+ * stops entirely. Slower and alive beats fast and dead.
+ *
+ * `sync` keeps its 15-minute tick because it no longer costs a fixed amount —
+ * `sync-cadence` scales each wallet's polling interval by how recently it
+ * traded, so a tick with nothing due makes no provider calls at all. The jobs
+ * below have no such per-item throttle, so their cost is the interval.
+ */
 const JOBS: ScheduledJob[] = [
   { name: 'sync', path: '/api/cron/sync', everyMinutes: 15 },
-  { name: 'portfolios', path: '/api/cron/portfolios', everyMinutes: 60 },
-  { name: 'deepen-traces', path: '/api/cron/deepen-traces?limit=10&pages=8', everyMinutes: 90 },
-  { name: 'tokens', path: '/api/cron/tokens', everyMinutes: 120 },
-  { name: 'backfill', path: '/api/cron/backfill?limit=5&max=400', everyMinutes: 240 },
-  { name: 'discover', path: '/api/cron/discover', everyMinutes: 360 },
-  { name: 'webhook-sync', path: '/api/cron/webhook-sync', everyMinutes: 360 },
+  { name: 'portfolios', path: '/api/cron/portfolios', everyMinutes: 180 },
+  { name: 'deepen-traces', path: '/api/cron/deepen-traces?limit=5&pages=4', everyMinutes: 360 },
+  { name: 'tokens', path: '/api/cron/tokens', everyMinutes: 240 },
+  { name: 'backfill', path: '/api/cron/backfill?limit=3&max=200', everyMinutes: 720 },
+  { name: 'discover', path: '/api/cron/discover', everyMinutes: 720 },
+  { name: 'webhook-sync', path: '/api/cron/webhook-sync', everyMinutes: 720 },
   { name: 'rebuild-positions', path: '/api/cron/rebuild-positions', everyMinutes: 1440 },
 ];
 

@@ -3,6 +3,7 @@
  * column shapes exist in exactly one place.
  */
 
+import { cadenceBreakdown, selectDueWhales } from '@/lib/core/sync-cadence';
 import { chunk } from '@/lib/providers/http';
 import type {
   Alert,
@@ -143,16 +144,34 @@ export async function getKnownWhaleAddresses(): Promise<Set<string>> {
   return new Set(rows.map((row) => row.address));
 }
 
-/** Whales due for a sync, oldest cursor first. */
+/**
+ * Whales actually due for a sync.
+ *
+ * The roster is read in full and filtered in `sync-cadence`, which scales each
+ * wallet's polling interval by how recently it traded. Ordering by
+ * `last_synced_at` and taking the first N — the previous behaviour — always
+ * returned a full batch, because something is always the least-recently-synced.
+ * That spent a full Helius budget every cycle even when no tracked wallet had
+ * moved.
+ *
+ * Reading every tracked row first is affordable: the roster is small, paged,
+ * and a single Supabase query, against one Helius request per whale returned.
+ */
 export async function getWhalesToSync(limit: number): Promise<Whale[]> {
-  const { data, error } = await db()
-    .from('whales')
-    .select('*')
-    .eq('is_tracked', true)
-    .order('last_synced_at', { ascending: true, nullsFirst: true })
-    .limit(limit);
-  if (error) throw new Error(`getWhalesToSync: ${error.message}`);
-  return (data ?? []) as Whale[];
+  const rows = await selectAllPages<Whale>('getWhalesToSync', (from, to) =>
+    db().from('whales').select('*').eq('is_tracked', true).range(from, to)
+  );
+
+  const now = Date.now();
+  const due = selectDueWhales(rows, now, limit);
+
+  if (rows.length && !due.length) {
+    console.info(
+      `[sync] nothing due; ${rows.length} tracked by tier ${JSON.stringify(cadenceBreakdown(rows, now))}`
+    );
+  }
+
+  return due;
 }
 
 export async function markWhaleSynced(
@@ -222,6 +241,30 @@ export async function getTrackedAddresses(): Promise<string[]> {
       .range(from, to)
   );
   return rows.map((row) => row.address);
+}
+
+/**
+ * The tracked roster, cached briefly.
+ *
+ * The webhook resolves this on every delivery to decide whose trades it is
+ * looking at, so on a busy roster it was one database read per pushed
+ * transaction. The roster only changes when discovery admits a wallet — every
+ * six hours at most — so a short TTL removes almost all of those reads while
+ * still picking up a new whale within a minute.
+ *
+ * A per-process cache is enough: staleness costs at worst one cycle of missed
+ * attribution for a just-added wallet, which the sync cron backfills anyway.
+ */
+const TRACKED_TTL_MS = 60_000;
+let trackedCache: { addresses: string[]; at: number } | null = null;
+
+export async function getTrackedAddressesCached(): Promise<string[]> {
+  if (trackedCache && Date.now() - trackedCache.at < TRACKED_TTL_MS) {
+    return trackedCache.addresses;
+  }
+  const addresses = await getTrackedAddresses();
+  trackedCache = { addresses, at: Date.now() };
+  return addresses;
 }
 
 // ---------------------------------------------------------------------------

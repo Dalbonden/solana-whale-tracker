@@ -44,7 +44,17 @@ export async function GET() {
     const { restrictedEndpoints } = await import('@/lib/providers/birdeye');
     const restricted = restrictedEndpoints();
 
-    const degraded = !database.ok || !configured.helius || !configured.birdeye;
+    /*
+     * Providers whose allowance is spent. Reported explicitly because the
+     * symptom is otherwise indistinguishable from a network fault: every call
+     * fails, jobs log errors, and nothing says the reason is a monthly quota
+     * that will reset on its own.
+     */
+    const { budgetStatus } = await import('@/lib/providers/budget');
+    const exhausted = budgetStatus();
+
+    const degraded =
+      !database.ok || !configured.helius || !configured.birdeye || exhausted.length > 0;
 
     return ok(
       {
@@ -60,6 +70,15 @@ export async function GET() {
               : 'pump.fun API unreachable — snipe detection falls back to first-trade time from Birdeye OHLCV.',
           },
         },
+        exhaustedProviders: exhausted.length
+          ? {
+              providers: exhausted,
+              note:
+                'These providers reported their usage allowance is spent, so the app is ' +
+                'skipping their calls until the retry time rather than burning what is left. ' +
+                'Allowances reset on the provider’s own billing cycle.',
+            }
+          : undefined,
         birdeyePlan: {
           restrictedEndpoints: restricted,
           note: restricted.length

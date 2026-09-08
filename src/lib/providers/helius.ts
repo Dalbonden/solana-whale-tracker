@@ -434,7 +434,22 @@ export async function upsertWebhook(addresses: string[]): Promise<HeliusWebhook>
     webhookURL,
     // Helius caps a single webhook at 100k addresses; we stay far below that.
     accountAddresses: addresses.slice(0, 100_000),
-    transactionTypes: ['SWAP', 'TRANSFER', 'UNKNOWN'],
+    /*
+     * SWAP only.
+     *
+     * This was previously ['SWAP', 'TRANSFER', 'UNKNOWN'], which subscribes to
+     * essentially every transaction an active wallet takes part in — dust
+     * airdrops, SPL transfers, staking, anything unclassified. Across fifteen
+     * whales that produced 333,719 deliveries, and the recorded results show
+     * the overwhelming majority parsed to zero trades. Each one still cost a
+     * Helius credit, a database read and a database write, which is how a
+     * month's allowance disappeared.
+     *
+     * The tracker only ever ingests swaps: `parseSwaps` discards everything
+     * else. Subscribing to types we then throw away is pure cost, so the
+     * subscription now matches what the parser actually consumes.
+     */
+    transactionTypes: ['SWAP'],
     webhookType: config.app.isProd ? 'enhanced' : 'enhancedDevnet',
     authHeader: config.auth.webhookSecret,
   };

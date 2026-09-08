@@ -7,6 +7,15 @@
  * upstream can never eat a serverless function's whole budget.
  */
 
+import {
+  isExhausted,
+  markExhausted,
+  markHealthy,
+  providerFromLabel,
+  QuotaExhaustedError,
+  quotaSignal,
+} from './budget';
+
 export class HttpError extends Error {
   constructor(
     message: string,
@@ -43,6 +52,18 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
     ...init
   } = options;
 
+  /*
+   * Refuse before the network, not after.
+   *
+   * A provider whose allowance is spent answers every call the same way, so
+   * without this check each job re-discovers the exhaustion itself — with
+   * retries and backoff on top, and on some plans billing for the attempts.
+   */
+  const provider = providerFromLabel(label);
+  if (isExhausted(provider)) {
+    throw new QuotaExhaustedError(provider, `allowance exhausted; not retrying until cooldown ends`);
+  }
+
   let lastError: unknown;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -65,6 +86,15 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
 
       if (!response.ok) {
         const body = await response.text().catch(() => '');
+
+        // An exhausted allowance is not a transient failure. Retrying it wastes
+        // time and, on metered plans, spends what little is left.
+        const quota = quotaSignal(response.status, body);
+        if (quota) {
+          markExhausted(provider, quota);
+          throw new QuotaExhaustedError(provider, quota);
+        }
+
         const error = new HttpError(
           `${label} responded ${response.status}`,
           response.status,
@@ -86,9 +116,24 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
 
       // 204 / empty body
       const text = await response.text();
+
+      /*
+       * Helius answers `max usage reached` as plain text on a 200, so a quota
+       * wall can arrive looking like success. Checking here as well as on the
+       * error path is what stops it being reported as a parse failure.
+       */
+      const quota = quotaSignal(response.status, text);
+      if (quota) {
+        markExhausted(provider, quota);
+        throw new QuotaExhaustedError(provider, quota);
+      }
+
+      markHealthy(provider);
       if (!text) return null as T;
       return JSON.parse(text) as T;
     } catch (error) {
+      // Never retry past the guard.
+      if (error instanceof QuotaExhaustedError) throw error;
       lastError = error;
       const isAbort = error instanceof Error && error.name === 'AbortError';
       const isNetwork = error instanceof TypeError;
