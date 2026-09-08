@@ -153,6 +153,29 @@ function mostOverdue(now: number): ScheduledJob | null {
   return pick;
 }
 
+/**
+ * How soon a failed job is retried, rather than waiting its whole interval.
+ *
+ * Recording the run before the call is right — it stops a job that dies
+ * mid-run being retried every tick — but it also meant a *failed* run consumed
+ * the full interval. On the twelve-hourly jobs that is severe: webhook-sync
+ * failed once because a provider was briefly refusing calls, and the
+ * subscription it exists to repair would then have stayed broken for twelve
+ * hours, generating the very load that caused the failure.
+ */
+const RETRY_AFTER_FAILURE_MS = 15 * 60_000;
+
+/** Rewinds a job's clock so a failure is retried soon instead of next cycle. */
+function scheduleRetry(job: ScheduledJob, now: number): void {
+  const interval = job.everyMinutes * 60_000;
+  // Frequent jobs already come round sooner than the retry delay.
+  if (interval <= RETRY_AFTER_FAILURE_MS) return;
+  state().lastRun.set(job.name, now + RETRY_AFTER_FAILURE_MS - interval);
+  console.warn(
+    `[scheduler] ${job.name} will retry in ${RETRY_AFTER_FAILURE_MS / 60_000}m rather than ${job.everyMinutes}m`
+  );
+}
+
 async function tick(): Promise<void> {
   const current = state();
   if (current.running) return;
@@ -177,9 +200,11 @@ async function tick(): Promise<void> {
       console.log(`[scheduler] ${job.name} ok in ${seconds}s`);
     } else {
       console.warn(`[scheduler] ${job.name} returned ${response.status} after ${seconds}s`);
+      scheduleRetry(job, Date.now());
     }
   } catch (error) {
     console.warn(`[scheduler] ${job.name} failed:`, (error as Error).message);
+    scheduleRetry(job, Date.now());
   } finally {
     current.running = false;
   }
