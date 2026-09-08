@@ -421,12 +421,22 @@ export interface HeliusWebhook {
 }
 
 export async function listWebhooks(): Promise<HeliusWebhook[]> {
-  return requestSoft<HeliusWebhook[]>(apiUrl('/v0/webhooks'), { label: 'helius-webhooks' }, []);
+  // bypassBudget: see upsertWebhook — this is the read half of the same fix.
+  return requestSoft<HeliusWebhook[]>(
+    apiUrl('/v0/webhooks'),
+    { label: 'helius-webhooks', bypassBudget: true },
+    []
+  );
 }
 
 /**
  * Creates or updates the tracker's webhook so Helius pushes whale transactions
  * to `/api/webhooks/helius` the moment they confirm.
+ *
+ * These calls deliberately bypass the budget guard. The subscription they write
+ * is what determines how many billable deliveries arrive afterwards, so
+ * refusing to spend one credit here would preserve the old firehose that spent
+ * the allowance in the first place — the guard protecting the drain.
  */
 export async function upsertWebhook(addresses: string[]): Promise<HeliusWebhook> {
   const webhookURL = `${config.app.url.replace(/\/$/, '')}/api/webhooks/helius`;
@@ -461,6 +471,7 @@ export async function upsertWebhook(addresses: string[]): Promise<HeliusWebhook>
       method: 'PUT',
       body: JSON.stringify(payload),
       label: 'helius-webhook-update',
+      bypassBudget: true,
     });
   }
 
@@ -468,5 +479,6 @@ export async function upsertWebhook(addresses: string[]): Promise<HeliusWebhook>
     method: 'POST',
     body: JSON.stringify(payload),
     label: 'helius-webhook-create',
+    bypassBudget: true,
   });
 }

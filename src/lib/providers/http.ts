@@ -37,6 +37,18 @@ interface RequestOptions extends Omit<RequestInit, 'signal'> {
   backoffMs?: number;
   /** Label used in error messages. */
   label?: string;
+  /**
+   * Attempt the call even while the provider is marked exhausted.
+   *
+   * Reserved for calls that *reduce* future spend — re-registering the webhook
+   * subscription is the case this exists for. Skipping it to save one credit
+   * leaves the old, far more expensive subscription in place, so the guard
+   * would be protecting the allowance by preserving the thing draining it.
+   *
+   * A quota answer to a bypassed call still records the exhaustion; it just
+   * does not refuse to try.
+   */
+  bypassBudget?: boolean;
 }
 
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
@@ -49,6 +61,7 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
     retries = 2,
     backoffMs = 400,
     label = new URL(url).hostname,
+    bypassBudget = false,
     ...init
   } = options;
 
@@ -60,7 +73,7 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
    * retries and backoff on top, and on some plans billing for the attempts.
    */
   const provider = providerFromLabel(label);
-  if (isExhausted(provider)) {
+  if (!bypassBudget && isExhausted(provider)) {
     throw new QuotaExhaustedError(provider, `allowance exhausted; not retrying until cooldown ends`);
   }
 
