@@ -119,13 +119,41 @@ function baseUrl(): string {
  */
 async function seedFromHistory(): Promise<void> {
   const { lastRun } = state();
+  const intervals = new Map(JOBS.map((job) => [job.name, job.everyMinutes * 60_000]));
+
   try {
+    // Ordered newest-first, so the first row seen for a job is its latest run.
     const runs = await getRecentJobRuns(100);
+    const latest = new Map<string, { at: number; failed: boolean }>();
+
     for (const run of runs) {
       const name = String(run.job).replace(/^cron\./, '');
       const at = Date.parse(String(run.created_at));
-      if (!Number.isFinite(at)) continue;
-      if (!lastRun.has(name) || at > (lastRun.get(name) ?? 0)) lastRun.set(name, at);
+      if (!Number.isFinite(at) || latest.has(name)) continue;
+      latest.set(name, { at, failed: String(run.status) === 'error' });
+    }
+
+    for (const [name, run] of latest) {
+      const interval = intervals.get(name);
+
+      /*
+       * A failed run is seeded as due again shortly, not as a completed cycle.
+       *
+       * The in-process retry cannot carry this on its own: a free Render
+       * instance spins down when idle, so the process holding that timer
+       * usually dies before the retry fires. Without this, a job that failed
+       * once waits its entire interval measured from the failure — which is how
+       * webhook-sync came to sit twelve hours away from repairing a
+       * subscription that was actively draining the API allowance.
+       */
+      const effective =
+        run.failed && interval && interval > RETRY_AFTER_FAILURE_MS
+          ? run.at - interval + RETRY_AFTER_FAILURE_MS
+          : run.at;
+
+      if (!lastRun.has(name) || effective > (lastRun.get(name) ?? 0)) {
+        lastRun.set(name, effective);
+      }
     }
   } catch (error) {
     // No history is survivable: everything simply looks due, and the one-job
