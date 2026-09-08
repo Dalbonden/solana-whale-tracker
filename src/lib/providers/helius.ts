@@ -9,7 +9,16 @@
 import { config, required } from '@/lib/config';
 import { request, requestSoft } from './http';
 
-const RPC_LABEL = 'helius-rpc';
+/**
+ * Standard RPC is labelled by whose account actually pays for it.
+ *
+ * The budget guard keys off the label prefix, so calling an Alchemy endpoint
+ * `helius-rpc` would let an Alchemy outage mark Helius exhausted and silence
+ * DAS — which is billed separately and may be perfectly healthy.
+ */
+function rpcLabel(): string {
+  return config.solana.rpcIsSeparateFromHelius ? 'solana-rpc' : 'helius-rpc';
+}
 
 // --- Enhanced transaction shapes (subset we consume) ------------------------
 
@@ -169,12 +178,17 @@ interface RpcResponse<T> {
  * named object. Forcing an array on a DAS method yields
  * "invalid type: map, expected a sequence".
  */
-async function rpc<T>(method: string, params: unknown[] | Record<string, unknown>): Promise<T> {
+async function call<T>(
+  endpoint: string,
+  label: string,
+  method: string,
+  params: unknown[] | Record<string, unknown>
+): Promise<T> {
   const body = JSON.stringify({ jsonrpc: '2.0', id: method, method, params });
-  const response = await request<RpcResponse<T>>(config.solana.rpcUrl, {
+  const response = await request<RpcResponse<T>>(endpoint, {
     method: 'POST',
     body,
-    label: RPC_LABEL,
+    label,
     retries: 3,
     timeoutMs: 20_000,
   });
@@ -182,6 +196,24 @@ async function rpc<T>(method: string, params: unknown[] | Record<string, unknown
     throw new Error(`RPC ${method} failed: ${response.error.message}`);
   }
   return response.result as T;
+}
+
+/** Standard Solana JSON-RPC — follows `SOLANA_RPC_URL`, so any provider serves it. */
+async function rpc<T>(method: string, params: unknown[] | Record<string, unknown>): Promise<T> {
+  return call<T>(config.solana.rpcUrl, rpcLabel(), method, params);
+}
+
+/**
+ * Digital Asset Standard call — `getAsset` / `getAssetBatch`.
+ *
+ * Kept on its own endpoint because DAS is a Metaplex extension rather than
+ * standard RPC, so it does not follow `SOLANA_RPC_URL` when that is pointed at
+ * a general provider. It also carries its own budget label: DAS and plain RPC
+ * are billed by different accounts once the two are split, and marking one
+ * exhausted must not silence the other.
+ */
+async function das<T>(method: string, params: unknown[] | Record<string, unknown>): Promise<T> {
+  return call<T>(config.solana.dasUrl, 'helius-das', method, params);
 }
 
 export interface TokenAccountBalance {
@@ -285,7 +317,7 @@ export async function getMintInfo(mint: string): Promise<MintInfo | null> {
  */
 export async function getUpdateAuthority(mint: string): Promise<string | null> {
   try {
-    const asset = await rpc<{
+    const asset = await das<{
       authorities?: Array<{ address: string; scopes?: string[] }>;
     }>('getAsset', { id: mint });
     return asset?.authorities?.[0]?.address ?? null;
@@ -331,7 +363,7 @@ export async function getAssetsBatch(mints: string[]): Promise<Map<string, Asset
   for (let i = 0; i < unique.length; i += 1000) {
     const batch = unique.slice(i, i + 1000);
     try {
-      const assets = await rpc<
+      const assets = await das<
         Array<{
           id: string;
           content?: {

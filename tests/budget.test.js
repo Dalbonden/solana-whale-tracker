@@ -53,6 +53,22 @@ test('labels map onto the provider that bills them', () => {
   assert.equal(providerFromLabel('api.example.com'), 'other');
 });
 
+test('a non-Helius RPC provider gets its own exhaustion state', () => {
+  // Both endpoints are reached through helius.ts, so labelling a third-party
+  // RPC 'helius-rpc' would let its outage silence DAS, which is billed by a
+  // different account and may be perfectly healthy.
+  assert.equal(providerFromLabel('solana-rpc'), 'rpc');
+  assert.equal(providerFromLabel('helius-das'), 'helius');
+  assert.notEqual(providerFromLabel('solana-rpc'), providerFromLabel('helius-das'));
+});
+
+test('exhausting the standalone RPC does not silence Helius DAS', () => {
+  markExhausted('rpc', 'alchemy out', 10_000);
+  assert.equal(isExhausted('rpc'), true);
+  assert.equal(isExhausted('helius'), false, 'DAS must still be callable');
+  markHealthy('rpc');
+});
+
 test('an exhausted provider is skipped until the cooldown expires', () => {
   markExhausted('birdeye', 'test reason', 10_000);
   assert.equal(isExhausted('birdeye'), true);

@@ -27,7 +27,15 @@
  * restart re-probing once is harmless.
  */
 
-export type Provider = 'helius' | 'birdeye' | 'jupiter' | 'geckoterminal' | 'solscan' | 'other';
+export type Provider =
+  | 'helius'
+  /** A standard-RPC provider that is not Helius, billed by its own account. */
+  | 'rpc'
+  | 'birdeye'
+  | 'jupiter'
+  | 'geckoterminal'
+  | 'solscan'
+  | 'other';
 
 /**
  * How long to stay quiet before testing a provider again.
@@ -41,6 +49,9 @@ export const COOLDOWN_MS = 30 * 60_000;
 /** Maps an HTTP label like `helius-history` onto the provider that bills it. */
 export function providerFromLabel(label: string): Provider {
   const name = label.toLowerCase();
+  // Checked before 'helius' would ever match; a separate RPC provider must not
+  // share Helius's exhaustion state.
+  if (name.startsWith('solana-rpc')) return 'rpc';
   if (name.startsWith('helius')) return 'helius';
   if (name.startsWith('birdeye')) return 'birdeye';
   if (name.startsWith('jupiter')) return 'jupiter';

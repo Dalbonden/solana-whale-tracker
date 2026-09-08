@@ -87,7 +87,14 @@ export async function GET() {
               'wallet_token_list falls back to RPC balances plus a price lookup.'
             : undefined,
         },
-        rpc: config.solana.rpcUrl.replace(/api-key=[^&]+/, 'api-key=***'),
+        rpc: {
+          standard: config.solana.rpcUrl.replace(/api-key=[^&]+/, 'api-key=***'),
+          das: config.solana.dasUrl.replace(/api-key=[^&]+/, 'api-key=***'),
+          splitFromHelius: config.solana.rpcIsSeparateFromHelius,
+          note: config.solana.rpcIsSeparateFromHelius
+            ? undefined
+            : 'Standard RPC and DAS are both on the Helius account. Set SOLANA_RPC_URL to a second provider to move the bulk load off it; DAS stays on Helius automatically.',
+        },
         scheduler: schedulerStatus(),
       recentJobs: jobs,
         timestamp: new Date().toISOString(),

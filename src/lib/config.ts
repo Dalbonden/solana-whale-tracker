@@ -55,7 +55,16 @@ export const config = {
   },
 
   solana: {
-    /** Falls back to Helius-from-key, then to the public endpoint (heavily rate limited). */
+    /**
+     * Standard JSON-RPC. Any Solana provider serves these, so this is the knob
+     * for moving bulk load off a metered account: point `SOLANA_RPC_URL` at a
+     * second provider and `getTokenAccountsByOwner`, `getBalance`,
+     * `getAccountInfo`, `getTokenLargestAccounts` and `getMultipleAccounts` all
+     * follow it.
+     *
+     * Falls back to Helius-from-key, then to the public endpoint (heavily rate
+     * limited, and it refuses some methods outright).
+     */
     get rpcUrl(): string {
       const explicit = optional('SOLANA_RPC_URL');
       if (explicit && !explicit.includes('YOUR_HELIUS_KEY')) return explicit;
@@ -63,9 +72,37 @@ export const config = {
       if (key) return `https://mainnet.helius-rpc.com/?api-key=${key}`;
       return 'https://api.mainnet-beta.solana.com';
     },
+
+    /**
+     * Digital Asset Standard endpoint — `getAsset` and `getAssetBatch`.
+     *
+     * Deliberately separate from `rpcUrl`. DAS is a Metaplex extension, not
+     * part of standard Solana RPC: Helius serves it, most general providers
+     * (Alchemy among them) do not. Sending these two methods to whatever
+     * `SOLANA_RPC_URL` points at is how splitting the load quietly breaks token
+     * metadata and long-tail pricing, with the failure surfacing as portfolios
+     * that have lost their symbols rather than as an error.
+     *
+     * Prefers a Helius key when one exists, and only falls back to `rpcUrl`
+     * when there is nothing better — in which case the caller's own soft-fail
+     * path handles the unsupported method.
+     */
+    get dasUrl(): string {
+      const explicit = optional('SOLANA_DAS_URL');
+      if (explicit) return explicit;
+      const key = optional('HELIUS_API_KEY');
+      if (key) return `https://mainnet.helius-rpc.com/?api-key=${key}`;
+      return this.rpcUrl;
+    },
+
     heliusApiKey: optional('HELIUS_API_KEY'),
     get hasHelius(): boolean {
       return Boolean(optional('HELIUS_API_KEY'));
+    },
+    /** True when standard RPC has been moved off the Helius account. */
+    get rpcIsSeparateFromHelius(): boolean {
+      const explicit = optional('SOLANA_RPC_URL');
+      return Boolean(explicit) && !explicit.includes('helius');
     },
   },
 
