@@ -410,12 +410,40 @@ export async function getSignatures(
 }
 
 /** Largest holders of a mint — the cheapest whale-candidate source there is. */
+/**
+ * Top token accounts for a mint.
+ *
+ * This one method gets a fallback the others do not need. It is an expensive
+ * whole-supply scan, and a general RPC provider will not always complete it:
+ * measured against Alchemy, the same call failed with `-32001 Unable to
+ * complete request at this time` for USDC, and for BONK failed once then
+ * succeeded twice. It is also served by a visibly different backend there
+ * (apiVersion 2.3.3, against 4.2.2 for every other method), so the flakiness is
+ * structural rather than a passing outage.
+ *
+ * Failing here would leave forensics reporting "holder list unavailable" —
+ * an infrastructure limit presented as a finding about the token, which is
+ * exactly the class of bug this codebase keeps having to remove. So a failure
+ * on the standard endpoint retries against the DAS endpoint, which on the
+ * default configuration is Helius and handled this reliably.
+ */
 export async function getLargestTokenAccounts(
   mint: string
 ): Promise<Array<{ address: string; uiAmount: number }>> {
-  const result = await rpc<{
-    value: Array<{ address: string; uiAmount: number | null }>;
-  }>('getTokenLargestAccounts', [mint, { commitment: 'confirmed' }]);
+  type LargestAccounts = { value: Array<{ address: string; uiAmount: number | null }> };
+  const params = [mint, { commitment: 'confirmed' }];
+
+  let result: LargestAccounts | null = null;
+  try {
+    result = await rpc<LargestAccounts>('getTokenLargestAccounts', params);
+  } catch (error) {
+    // Only worth a second attempt when the two endpoints are actually different.
+    if (config.solana.dasUrl === config.solana.rpcUrl) throw error;
+    console.warn(
+      `[helius] getTokenLargestAccounts failed on the standard RPC (${(error as Error).message}); retrying on the DAS endpoint.`
+    );
+    result = await das<LargestAccounts>('getTokenLargestAccounts', params);
+  }
 
   return (result?.value ?? [])
     .filter((entry) => (entry.uiAmount ?? 0) > 0)
