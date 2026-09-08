@@ -1,0 +1,47 @@
+# =============================================================================
+# Netlify configuration — https://docs.netlify.com/configure-builds/file-based-configuration/
+#
+# In Netlify: Add new site → Import from Git → pick this repo. The build
+# settings below are applied automatically; the API keys are NOT — set those
+# under Site configuration → Environment variables (see README § Deploying).
+#
+# WHY THIS DIFFERS FROM THE RENDER SETUP
+#
+# Render ran one long-lived Node process, so the tracker scheduled its own jobs
+# in-process from `src/instrumentation.ts`. Netlify has no such process: every
+# route is a short-lived serverless function, and a `setInterval` registered
+# during one invocation dies with it. The in-process scheduler therefore turns
+# itself off here (see `schedulerEnabled`), and the scheduled functions under
+# `netlify/functions/` take over — Netlify's own cron invokes those.
+# =============================================================================
+
+[build]
+  # `--include=dev` is required, not optional: tailwindcss, postcss,
+  # autoprefixer and typescript are devDependencies but run at BUILD time.
+  # Netlify builds with NODE_ENV=production, under which `npm ci` omits
+  # devDependencies entirely and the build dies on "Cannot find module
+  # 'autoprefixer'".
+  command = "npm ci --include=dev && npm run build"
+  publish = ".next"
+
+[build.environment]
+  # Next 14 + the Netlify runtime want a current LTS.
+  NODE_VERSION = "20"
+  # Repeat of the flag above for any install Netlify runs on its own.
+  NPM_FLAGS = "--include=dev"
+
+# Maps the Next.js App Router onto Netlify Functions and the edge CDN.
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
+
+# -----------------------------------------------------------------------------
+# Headers
+# -----------------------------------------------------------------------------
+
+# The cron endpoints authenticate with a bearer token and write to the database.
+# Nothing should ever cache them, and no crawler should index them.
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Cache-Control = "no-store, max-age=0"
+    X-Robots-Tag = "noindex"

@@ -44,6 +44,10 @@ export const config = {
       return (
         optional('APP_URL') ||
         optional('RENDER_EXTERNAL_URL') ||
+        // Netlify sets URL to the site's canonical address on production
+        // builds, and DEPLOY_PRIME_URL to the branch/preview address.
+        optional('URL') ||
+        optional('DEPLOY_PRIME_URL') ||
         (optional('VERCEL_PROJECT_PRODUCTION_URL')
           ? `https://${optional('VERCEL_PROJECT_PRODUCTION_URL')}`
           : '') ||
@@ -52,6 +56,15 @@ export const config = {
       );
     },
     isProd: process.env.NODE_ENV === 'production',
+    /**
+     * True on Netlify, where there is no long-lived process to schedule from —
+     * every route is a short-lived function, so `setInterval` dies with the
+     * invocation that registered it. Netlify's own scheduled functions
+     * (`netlify/functions/`) drive the jobs instead.
+     */
+    get isServerless(): boolean {
+      return Boolean(optional('NETLIFY') || optional('VERCEL'));
+    },
   },
 
   solana: {

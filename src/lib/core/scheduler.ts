@@ -1,17 +1,24 @@
 /**
- * In-process scheduler.
+ * In-process scheduler — used only where a process stays alive.
  *
- * The app runs as a long-lived Node server, so it can drive its own scheduled
- * work rather than depending on something outside to poke it. That matters more
- * than it sounds: without a scheduler this tracker does not track. Whale
- * activity is only ingested when `sync` runs, cost basis only deepens when
- * `backfill` runs, and `/compounders` has nothing to plot unless `portfolios`
- * has been writing snapshots all along.
+ * On a long-lived Node server (a Render instance, `next start`, local dev with
+ * SCHEDULER=on) the app drives its own scheduled work rather than depending on
+ * something outside to poke it. That matters more than it sounds: without a
+ * scheduler this tracker does not track.
  *
- * The alternative — GitHub Actions or an external pinger — works, but it needs
- * two secrets configured by hand in a second system, and a data pipeline that
- * silently does nothing until someone completes an optional setup step is a bad
- * design. This is on by default and needs nothing.
+ * On a serverless host it is off, and must be. Every route there is a
+ * short-lived function, so a timer registered during one invocation dies with
+ * it — and a new one would be registered by every cold start, giving not one
+ * scheduler but an unbounded number of them. Netlify's own cron drives the
+ * jobs instead; the timetable in that case is `netlify/functions/`, not the
+ * JOBS list below.
+ *
+ * Either way something must run these: whale activity is only ingested when
+ * `sync` runs, cost basis only deepens when `backfill` runs, and
+ * `/compounders` has nothing to plot unless `portfolios` has been writing
+ * snapshots all along. A data pipeline that silently does nothing until someone
+ * completes an optional setup step is a bad design, so both paths are on by
+ * default and neither needs a second system configured by hand.
  *
  * ── Catch-up, not clockwork ──
  *
@@ -39,16 +46,6 @@ interface ScheduledJob {
   everyMinutes: number;
 }
 
-/*
- * Cadences mirror what the work is actually for.
- *
- * `portfolios` is hourly because it is the sole source of net-worth history and
- * a trajectory needs three points across a day before it says anything — the
- * interval here is the resolution of that entire feature.
- *
- * `sync` is the most frequent because it is the only thing that notices a whale
- * trading at all, and it doubles as the keep-warm request.
- */
 /*
  * Cadence is set by what each job costs on a free API allowance, not by how
  * often fresh data would be nice to have.
@@ -243,6 +240,18 @@ export function schedulerEnabled(): boolean {
   if (flag === 'off' || flag === 'false' || flag === '0') return false;
   if (flag === 'on' || flag === 'true' || flag === '1') return true;
 
+  /*
+   * Never on a serverless host.
+   *
+   * This scheduler works by holding a timer in a process that stays alive.
+   * Netlify and Vercel give each request its own short-lived function, so the
+   * interval dies with the invocation that created it — and worse, a *new* one
+   * would be registered by every cold start, so instead of one scheduler there
+   * would be an unbounded number of them, each firing jobs. The platform's own
+   * cron runs the jobs there (see `netlify/functions/`).
+   */
+  if (config.app.isServerless) return false;
+
   // Default: on when deployed and able to authenticate against its own routes.
   // Off in development, where an unattended scheduler would quietly burn the
   // free tier of every upstream API while someone edits a component.
@@ -271,13 +280,26 @@ export function startScheduler(): void {
 export function schedulerStatus(): {
   enabled: boolean;
   running: boolean;
+  driver: 'in-process' | 'platform-cron';
+  note?: string;
   jobs: Array<{ name: string; everyMinutes: number; lastRunAt: string | null; dueInMinutes: number }>;
 } {
   const now = Date.now();
   const current = state();
+  const serverless = config.app.isServerless;
   return {
     enabled: schedulerEnabled(),
     running: current.running,
+    /*
+     * Stated explicitly so a disabled in-process scheduler is not mistaken for
+     * a broken deployment. On Netlify that is the correct configuration, and
+     * the schedules below are the Render cadence rather than what is actually
+     * running -- the real timetable lives in netlify/functions/.
+     */
+    driver: serverless ? 'platform-cron' : 'in-process',
+    note: serverless
+      ? 'Running on a serverless host: jobs are driven by the platform cron in netlify/functions/, not by this process. The intervals listed here are not in effect.'
+      : undefined,
     jobs: JOBS.map((job) => {
       const last = current.lastRun.get(job.name) ?? null;
       const due = (last ?? 0) + job.everyMinutes * 60_000;
