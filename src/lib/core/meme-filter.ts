@@ -13,6 +13,7 @@
 
 import { getToken, listActiveMints, listTokens, upsertTokens } from '@/lib/db/repositories';
 import * as birdeye from '@/lib/providers/birdeye';
+import * as jupiter from '@/lib/providers/jupiter';
 import * as pumpfun from '@/lib/providers/pumpfun';
 import { NON_MEME_MINTS, looksLikePumpfunMint } from '@/lib/solana/constants';
 import type { MemeToken } from '@/types';
@@ -89,6 +90,69 @@ export function isExcludedMint(mint: string): boolean {
 // Classification
 // ---------------------------------------------------------------------------
 
+/*
+ * Organic-volume thresholds, set from measurement rather than intuition.
+ *
+ * Measured across the tracked universe, genuinely traded meme tokens span a
+ * far wider range than expected: BOME 0.6%, MEW 1.1%, WIF 7.3%, BONK 8.2%,
+ * POPCAT 8.3%, FWOG 28.6%. An earlier 2% floor would therefore have rejected
+ * BOME and MEW — both real, both already curated — which is the same mistake
+ * this codebase keeps having to undo: a filter that reads a limitation of the
+ * signal as a fact about the subject.
+ *
+ * So near-zero is the only level that actually distinguishes wash trading, and
+ * even that is only meaningful once there is enough volume for the ratio to
+ * mean anything. Between the two bounds the share informs confidence instead of
+ * deciding admission.
+ */
+const WASH_TRADE_ORGANIC_SHARE = 0.001;
+/** Below this, the organic ratio is too noisy to reject anything on. */
+const WASH_TRADE_MIN_VOLUME_USD = 50_000;
+/** A comfortably organic token earns a small bonus. */
+const HEALTHY_ORGANIC_SHARE = 0.05;
+
+interface TokenSnapshot {
+  symbol: string | null;
+  name: string | null;
+  liquidity: number | null;
+  volume24h: number | null;
+  marketCap: number | null;
+  /** Jupiter only; null means unknown, never zero. */
+  organicVolume24h: number | null;
+}
+
+/**
+ * Market snapshot for one mint, from whichever provider can answer.
+ *
+ * Jupiter first because it is keyless and unmetered, so classification during a
+ * discovery sweep no longer spends Birdeye compute units per candidate. Birdeye
+ * remains the fallback for mints Jupiter has never indexed.
+ */
+async function tokenSnapshot(mint: string): Promise<TokenSnapshot | null> {
+  const meta = (await jupiter.getTokenMeta([mint])).get(mint);
+  if (meta) {
+    return {
+      symbol: meta.symbol || null,
+      name: meta.name || null,
+      liquidity: meta.liquidity,
+      volume24h: meta.volume24hUsd,
+      marketCap: meta.mcap,
+      organicVolume24h: meta.organicVolume24hUsd,
+    };
+  }
+
+  const overview = await birdeye.getTokenOverview(mint);
+  if (!overview) return null;
+  return {
+    symbol: overview.symbol ?? null,
+    name: overview.name ?? null,
+    liquidity: overview.liquidity ?? null,
+    volume24h: overview.v24hUSD ?? null,
+    marketCap: birdeye.marketCapOf(overview),
+    organicVolume24h: null,
+  };
+}
+
 export interface ClassificationResult {
   isMeme: boolean;
   confidence: number;
@@ -129,8 +193,8 @@ export async function classifyToken(mint: string): Promise<ClassificationResult>
     reasons.push('pump.fun mint suffix');
   }
 
-  const overview = await birdeye.getTokenOverview(mint);
-  if (!overview) {
+  const snapshot = await tokenSnapshot(mint);
+  if (!snapshot) {
     return {
       isMeme: confidence >= 0.5,
       confidence,
@@ -139,9 +203,9 @@ export async function classifyToken(mint: string): Promise<ClassificationResult>
     };
   }
 
-  const liquidity = overview.liquidity ?? 0;
-  const volume = overview.v24hUSD ?? 0;
-  const marketCap = birdeye.marketCapOf(overview) ?? 0;
+  const liquidity = snapshot.liquidity ?? 0;
+  const volume = snapshot.volume24h ?? 0;
+  const marketCap = snapshot.marketCap ?? 0;
 
   if (liquidity < AUTO_ADD_THRESHOLDS.minLiquidityUsd) {
     reasons.push(`liquidity $${Math.round(liquidity).toLocaleString()} below floor`);
@@ -159,7 +223,7 @@ export async function classifyToken(mint: string): Promise<ClassificationResult>
   confidence += 0.2;
   reasons.push('clears liquidity and volume floors');
 
-  const haystack = `${overview.name ?? ''} ${overview.symbol ?? ''}`;
+  const haystack = `${snapshot.name ?? ''} ${snapshot.symbol ?? ''}`;
   if (MEME_NAME_PATTERNS.some((pattern) => pattern.test(haystack))) {
     confidence += 0.3;
     reasons.push('name/symbol matches meme vocabulary');
@@ -175,6 +239,30 @@ export async function classifyToken(mint: string): Promise<ClassificationResult>
   if (marketCap >= AUTO_ADD_THRESHOLDS.minMarketCapUsd && marketCap < 500_000_000) {
     confidence += 0.1;
     reasons.push('market cap in meme-token band');
+  }
+
+  /*
+   * Volume floors are trivially faked, and the turnover bonus above rewards
+   * exactly the pattern a wash trader produces. Jupiter reports how much of the
+   * volume it attributes to organic traders, so a token whose reported volume
+   * is real but whose organic share is negligible can be rejected rather than
+   * scored highly for its churn. Only applied when the figure is available --
+   * Birdeye has no equivalent, and absence is not evidence.
+   */
+  if (snapshot.organicVolume24h !== null && volume > 0) {
+    const organicShare = snapshot.organicVolume24h / volume;
+
+    if (organicShare < WASH_TRADE_ORGANIC_SHARE && volume >= WASH_TRADE_MIN_VOLUME_USD) {
+      reasons.push(
+        `$${Math.round(volume).toLocaleString()} of 24h volume with essentially none of it organic — reads as wash trading`
+      );
+      return { isMeme: false, confidence, reasons, source };
+    }
+
+    if (organicShare >= HEALTHY_ORGANIC_SHARE) {
+      confidence += 0.1;
+      reasons.push(`${(organicShare * 100).toFixed(1)}% of volume is organic`);
+    }
   }
 
   return { isMeme: confidence >= 0.6, confidence: Math.min(confidence, 1), reasons, source };
@@ -203,30 +291,35 @@ export async function addTokenToUniverse(
     }
   }
 
-  const [overview, pumpCoin] = await Promise.all([
-    birdeye.getTokenOverview(mint),
+  // Jupiter first, Birdeye only if it has never indexed the mint. Admission
+  // runs once per candidate during a discovery sweep, so this was one metered
+  // call per evaluation on top of the one classifyToken already made.
+  const [meta, pumpCoin] = await Promise.all([
+    jupiter.getTokenMeta([mint]).then((m) => m.get(mint) ?? null),
     looksLikePumpfunMint(mint) ? pumpfun.getCoin(mint) : Promise.resolve(null),
   ]);
+  const overview = meta ? null : await birdeye.getTokenOverview(mint);
 
-  if (!overview && !pumpCoin && !opts.force) {
+  if (!meta && !overview && !pumpCoin && !opts.force) {
     return { added: false, reason: 'no metadata found for mint' };
   }
 
   const token: Partial<MemeToken> = {
     mint,
-    symbol: overview?.symbol ?? pumpCoin?.symbol ?? mint.slice(0, 6),
-    name: overview?.name ?? pumpCoin?.name ?? null,
-    decimals: overview?.decimals ?? 6,
-    logo_uri: overview?.logoURI ?? pumpCoin?.image_uri ?? null,
+    symbol: meta?.symbol || overview?.symbol || pumpCoin?.symbol || mint.slice(0, 6),
+    name: meta?.name || overview?.name || pumpCoin?.name || null,
+    decimals: meta?.decimals ?? overview?.decimals ?? 6,
+    logo_uri: meta?.logoUri ?? overview?.logoURI ?? pumpCoin?.image_uri ?? null,
     source: opts.source ?? (pumpCoin ? 'pumpfun' : 'birdeye'),
     is_core: CORE_MINTS.has(mint),
     is_active: true,
-    price_usd: overview?.price ?? null,
-    market_cap_usd: birdeye.marketCapOf(overview ?? null) ?? pumpCoin?.usd_market_cap ?? null,
-    liquidity_usd: overview?.liquidity ?? null,
-    volume_24h_usd: overview?.v24hUSD ?? null,
-    price_change_24h: overview?.priceChange24hPercent ?? null,
-    holder_count: overview?.holder ?? null,
+    price_usd: meta?.usdPrice ?? overview?.price ?? null,
+    market_cap_usd:
+      meta?.mcap ?? birdeye.marketCapOf(overview ?? null) ?? pumpCoin?.usd_market_cap ?? null,
+    liquidity_usd: meta?.liquidity ?? overview?.liquidity ?? null,
+    volume_24h_usd: meta?.volume24hUsd ?? overview?.v24hUSD ?? null,
+    price_change_24h: meta?.priceChange24h ?? overview?.priceChange24hPercent ?? null,
+    holder_count: meta?.holderCount ?? overview?.holder ?? null,
     pumpfun_created_at: pumpCoin?.created_timestamp
       ? new Date(pumpCoin.created_timestamp).toISOString()
       : null,
@@ -270,33 +363,86 @@ export async function refreshTokenMarketData(mints: string[]): Promise<number> {
     (await listTokens({ activeOnly: false, limit: 500 })).map((token) => [token.mint, token])
   );
 
-  const { mapWithConcurrency } = await import('@/lib/providers/http');
+  const wanted = mints.slice(0, 100);
 
-  // Strictly serial: token_overview is one call per mint, and the Birdeye free
-  // tier allows roughly one request per second. Any concurrency here just
-  // produces 429s and leaves tokens unrefreshed.
-  await mapWithConcurrency(mints.slice(0, 100), 1, async (mint) => {
-    const overview = await birdeye.getTokenOverview(mint);
-    if (!overview) return;
+  /*
+   * One batched Jupiter call instead of a hundred serial Birdeye ones.
+   *
+   * `token_overview` is billed per mint and the free tier allows roughly one
+   * request a second, so refreshing a hundred tokens meant a hundred metered
+   * calls and around a hundred seconds — long enough that it cannot run inside
+   * a serverless function at all. Jupiter returns the same fields for a hundred
+   * mints in a single keyless request, and adds the organic-volume split, which
+   * distinguishes a token being traded from one being wash-traded.
+   */
+  const meta = await jupiter.getTokenMeta(wanted);
+
+  for (const mint of wanted) {
+    const token = meta.get(mint);
+    if (!token) continue;
 
     const current = existing.get(mint);
     const keepCurated = current?.is_core === true;
 
     updates.push({
       mint,
-      symbol: keepCurated ? current.symbol : overview.symbol || current?.symbol || mint.slice(0, 6),
-      name: keepCurated ? current.name : (overview.name ?? current?.name ?? null),
-      decimals: overview.decimals ?? current?.decimals ?? 6,
-      logo_uri: overview.logoURI ?? current?.logo_uri ?? null,
-      price_usd: overview.price ?? null,
-      market_cap_usd: birdeye.marketCapOf(overview),
-      liquidity_usd: overview.liquidity ?? null,
-      volume_24h_usd: overview.v24hUSD ?? null,
-      price_change_24h: overview.priceChange24hPercent ?? null,
-      holder_count: overview.holder ?? null,
+      symbol: keepCurated ? current.symbol : token.symbol || current?.symbol || mint.slice(0, 6),
+      name: keepCurated ? current.name : (token.name || current?.name || null),
+      decimals: token.decimals ?? current?.decimals ?? 6,
+      logo_uri: token.logoUri ?? current?.logo_uri ?? null,
+      price_usd: token.usdPrice,
+      market_cap_usd: token.mcap,
+      liquidity_usd: token.liquidity,
+      volume_24h_usd: token.volume24hUsd,
+      price_change_24h: token.priceChange24h,
+      holder_count: token.holderCount,
       last_refreshed_at: now,
     });
-  });
+  }
+
+  /*
+   * Birdeye covers only what Jupiter could not identify, and only while its own
+   * allowance holds. Falling back for every miss would reintroduce the serial
+   * cost this change exists to remove, so the tail is capped — an unrefreshed
+   * token keeps its previous values and its stale `last_refreshed_at`, which is
+   * honest, where a zeroed row would not be.
+   */
+  const missed = wanted.filter((mint) => !meta.has(mint));
+  const BIRDEYE_TAIL = 10;
+
+  if (missed.length) {
+    const { mapWithConcurrency } = await import('@/lib/providers/http');
+    if (missed.length > BIRDEYE_TAIL) {
+      console.info(
+        `[tokens] ${missed.length} mints unknown to Jupiter; refreshing the first ${BIRDEYE_TAIL} via Birdeye.`
+      );
+    }
+
+    await mapWithConcurrency(missed.slice(0, BIRDEYE_TAIL), 1, async (mint) => {
+      const overview = await birdeye.getTokenOverview(mint);
+      if (!overview) return;
+
+      const current = existing.get(mint);
+      const keepCurated = current?.is_core === true;
+
+      updates.push({
+        mint,
+        symbol: keepCurated
+          ? current.symbol
+          : overview.symbol || current?.symbol || mint.slice(0, 6),
+        name: keepCurated ? current.name : (overview.name ?? current?.name ?? null),
+        decimals: overview.decimals ?? current?.decimals ?? 6,
+        logo_uri: overview.logoURI ?? current?.logo_uri ?? null,
+        price_usd: overview.price ?? null,
+        market_cap_usd: birdeye.marketCapOf(overview),
+        liquidity_usd: overview.liquidity ?? null,
+        volume_24h_usd: overview.v24hUSD ?? null,
+        price_change_24h: overview.priceChange24hPercent ?? null,
+        holder_count: overview.holder ?? null,
+        last_refreshed_at: now,
+      });
+    });
+  }
 
   return upsertTokens(updates);
 }
@@ -309,9 +455,19 @@ export async function discoverNewMemeTokens(limit = 30): Promise<{
   evaluated: number;
   added: string[];
 }> {
-  const [graduated, trending] = await Promise.all([
+  /*
+   * Three keyless sources instead of one metered one.
+   *
+   * `trending` is the direct replacement for Birdeye's trending list. `organic`
+   * is the addition worth having: it ranks by Jupiter's organic-activity score,
+   * so it surfaces tokens with real traders rather than the wash-traded volume
+   * that a pure volume ranking puts at the top — the same population the
+   * classifier now rejects, so seeding from it wastes fewer evaluations.
+   */
+  const [graduated, trending, organic] = await Promise.all([
     pumpfun.getGraduatedCoins(limit),
-    birdeye.getTrendingTokens(limit),
+    jupiter.getTokenList('trending', limit),
+    jupiter.getTokenList('organic', limit),
   ]);
 
   const tracked = await getTrackedMints(true);
@@ -320,9 +476,9 @@ export async function discoverNewMemeTokens(limit = 30): Promise<{
   for (const coin of graduated) {
     if (!tracked.has(coin.mint)) candidates.add(coin.mint);
   }
-  for (const token of trending) {
-    if (token.address && !tracked.has(token.address) && !NON_MEME_MINTS.has(token.address)) {
-      candidates.add(token.address);
+  for (const token of [...trending, ...organic]) {
+    if (token.mint && !tracked.has(token.mint) && !NON_MEME_MINTS.has(token.mint)) {
+      candidates.add(token.mint);
     }
   }
 

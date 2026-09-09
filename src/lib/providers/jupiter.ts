@@ -158,6 +158,18 @@ export interface JupiterTokenMeta {
   holderCount: number | null;
   mcap: number | null;
   liquidity: number | null;
+  logoUri: string | null;
+  usdPrice: number | null;
+  /** Buy + sell volume over 24h, in USD. */
+  volume24hUsd: number | null;
+  priceChange24h: number | null;
+  /**
+   * Volume Jupiter attributes to organic traders rather than wash trading.
+   * A token whose total volume is large and whose organic volume is near zero
+   * is being traded by bots against themselves, which no Birdeye field exposed.
+   */
+  organicVolume24hUsd: number | null;
+  traders24h: number | null;
   /** When the first pool was created — the launch moment, without walking trades. */
   firstPoolAt: string | null;
   createdAt: string | null;
@@ -176,7 +188,17 @@ interface RawToken {
   organicScoreLabel?: string;
   isVerified?: boolean;
   createdAt?: string;
+  icon?: string;
+  usdPrice?: number;
   firstPool?: { createdAt?: string };
+  stats24h?: {
+    priceChange?: number;
+    buyVolume?: number;
+    sellVolume?: number;
+    buyOrganicVolume?: number;
+    sellOrganicVolume?: number;
+    numTraders?: number;
+  };
   audit?: {
     mintAuthorityDisabled?: boolean;
     freezeAuthorityDisabled?: boolean;
@@ -213,7 +235,30 @@ function toMeta(raw: RawToken): JupiterTokenMeta | null {
     liquidity: numberOrNull(raw.liquidity),
     firstPoolAt: raw.firstPool?.createdAt ?? null,
     createdAt: raw.createdAt ?? null,
+    logoUri: raw.icon || null,
+    usdPrice: numberOrNull(raw.usdPrice),
+    volume24hUsd: sumOrNull(raw.stats24h?.buyVolume, raw.stats24h?.sellVolume),
+    priceChange24h: numberOrNull(raw.stats24h?.priceChange),
+    organicVolume24hUsd: sumOrNull(
+      raw.stats24h?.buyOrganicVolume,
+      raw.stats24h?.sellOrganicVolume
+    ),
+    traders24h: numberOrNull(raw.stats24h?.numTraders),
   };
+}
+
+/**
+ * Adds two optional halves of a total.
+ *
+ * Returns null only when neither side is a number — a token with buys and no
+ * sells has a real volume of just its buys, and coercing that to null would
+ * report "unknown" for something we know exactly.
+ */
+function sumOrNull(a: unknown, b: unknown): number | null {
+  const left = numberOrNull(a);
+  const right = numberOrNull(b);
+  if (left === null && right === null) return null;
+  return (left ?? 0) + (right ?? 0);
 }
 
 /**
@@ -257,6 +302,39 @@ export async function getMintCreator(
   const meta = (await getTokenMeta([mint])).get(mint);
   if (!meta?.dev) return null;
   return { address: meta.dev, devMints: meta.devMints };
+}
+
+/**
+ * Ranked token lists — the candidate pool for auto-discovery.
+ *
+ * `trending` ranks by recent volume, the same intent as Birdeye's trending
+ * endpoint it replaces. `organic` ranks by Jupiter's organic-activity score,
+ * which is the more useful of the two here: it demotes tokens whose volume is
+ * bots trading against themselves, and that is precisely the population that
+ * kept polluting discovery. `recent` is brand-new listings, where the organic
+ * score is still 0 for everything and the list is raw launch flow.
+ */
+export type TokenList = 'trending' | 'organic' | 'recent';
+
+const LIST_PATHS: Record<TokenList, string> = {
+  trending: '/tokens/v2/toptrending/24h',
+  organic: '/tokens/v2/toporganicscore/24h',
+  recent: '/tokens/v2/recent',
+};
+
+export async function getTokenList(list: TokenList, limit = 50): Promise<JupiterTokenMeta[]> {
+  const payload = await requestSoft<RawToken[]>(
+    url(LIST_PATHS[list], { limit: String(Math.min(Math.max(limit, 1), 100)) }),
+    { label: `jupiter-list-${list}`, retries: 1, timeoutMs: 20_000 },
+    []
+  );
+
+  const out: JupiterTokenMeta[] = [];
+  for (const raw of Array.isArray(payload) ? payload : []) {
+    const meta = toMeta(raw);
+    if (meta) out.push(meta);
+  }
+  return out;
 }
 
 // --- Wallet balances ---------------------------------------------------------
