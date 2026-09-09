@@ -21,6 +21,9 @@ export async function GET(request: Request) {
   const auth = authorizeJob(request);
   if (!auth.ok) return auth.response;
 
+  // `?force=1` bypasses the double-run guard, for manual testing.
+  const force = new URL(request.url).searchParams.get('force') === '1';
+
   const url = new URL(request.url);
   const limit = Number(url.searchParams.get('limit')) || config.limits.whalesPerSync;
 
@@ -40,7 +43,7 @@ export async function GET(request: Request) {
       alertsCreated: result.totals.alerts,
       errors: result.errors.slice(0, 10),
     };
-  });
+  }, { minIntervalMinutes: 10, force });
 }
 
 export const POST = GET;

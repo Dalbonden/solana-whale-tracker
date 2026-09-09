@@ -19,6 +19,9 @@ export async function GET(request: Request) {
   const auth = authorizeJob(request);
   if (!auth.ok) return auth.response;
 
+  // `?force=1` bypasses the double-run guard, for manual testing.
+  const force = new URL(request.url).searchParams.get('force') === '1';
+
   const url = new URL(request.url);
   const maxCandidates = Number(url.searchParams.get('max')) || undefined;
   /*
@@ -49,7 +52,7 @@ export async function GET(request: Request) {
       rejectedSample: result.rejected.slice(0, 10),
       errors: result.errors.slice(0, 10),
     };
-  });
+  }, { minIntervalMinutes: 240, force });
 }
 
 export const POST = GET;

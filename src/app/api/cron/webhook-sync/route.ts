@@ -21,6 +21,9 @@ export async function GET(request: Request) {
   const auth = authorizeJob(request);
   if (!auth.ok) return auth.response;
 
+  // `?force=1` bypasses the double-run guard, for manual testing.
+  const force = new URL(request.url).searchParams.get('force') === '1';
+
   if (!config.solana.hasHelius) {
     return fail('HELIUS_API_KEY is not set; webhook sync is unavailable.', 503);
   }
@@ -59,7 +62,7 @@ export async function GET(request: Request) {
       webhookURL: webhook.webhookURL,
       subscribedAddresses: webhook.accountAddresses?.length ?? addresses.length,
     };
-  });
+  }, { minIntervalMinutes: 240, force });
 }
 
 export const POST = GET;

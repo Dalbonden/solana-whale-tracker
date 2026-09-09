@@ -804,6 +804,36 @@ export async function recordJobRun(entry: {
   if (error) console.error(`recordJobRun: ${error.message}`);
 }
 
+/**
+ * Minutes since a job last ran, or null when it never has.
+ *
+ * Exists to stop the same job being executed twice by two different
+ * schedulers. That is not hypothetical: after the move to Netlify the Render
+ * deployment was still live and still running its in-process scheduler against
+ * this same database, so every job had two independent triggers, each spending
+ * from the same metered Helius and Birdeye allowances.
+ *
+ * Reading `job_runs` rather than holding a lock keeps this correct across
+ * hosts, restarts and manual curls alike — the ledger is the shared truth, and
+ * it is already written by every job.
+ */
+export async function minutesSinceLastRun(job: string): Promise<number | null> {
+  const { data, error } = await db()
+    .from('job_runs')
+    .select('created_at')
+    .eq('job', job)
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (error) throw new Error(`minutesSinceLastRun: ${error.message}`);
+  const at = data?.[0]?.created_at;
+  if (!at) return null;
+
+  const parsed = Date.parse(String(at));
+  if (!Number.isFinite(parsed)) return null;
+  return (Date.now() - parsed) / 60_000;
+}
+
 export async function getRecentJobRuns(limit = 20) {
   const { data, error } = await db()
     .from('job_runs')

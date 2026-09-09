@@ -23,6 +23,9 @@ export async function GET(request: Request) {
   const auth = authorizeJob(request);
   if (!auth.ok) return auth.response;
 
+  // `?force=1` bypasses the double-run guard, for manual testing.
+  const force = new URL(request.url).searchParams.get('force') === '1';
+
   const url = new URL(request.url);
   const single = url.searchParams.get('address');
   const limit = Math.min(Number(url.searchParams.get('limit')) || 200, 500);
@@ -53,7 +56,7 @@ export async function GET(request: Request) {
       incompleteBasis: results.reduce((sum, r) => sum + r.incompleteBasis, 0),
       errors: errors.slice(0, 10),
     };
-  });
+  }, { minIntervalMinutes: 600, force });
 }
 
 export const POST = GET;

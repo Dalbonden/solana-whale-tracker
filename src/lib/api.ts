@@ -93,12 +93,53 @@ export function timingSafeEqual(a: string, b: string): boolean {
 }
 
 /** Wraps a job handler with timing, error capture and a run record. */
+export interface RunJobOptions {
+  /**
+   * Refuse to run when this job ran more recently than this.
+   *
+   * Guards against the same job having two independent triggers. After the move
+   * to Netlify the Render deployment was still live and still running its
+   * in-process scheduler against the same database, so every job fired twice —
+   * two sets of writes, and two draws on the same metered Helius and Birdeye
+   * allowances that had already been exhausted once.
+   *
+   * The check reads `job_runs`, so it holds across hosts, restarts and manual
+   * calls alike. There is a race — two callers can both read "not run yet"
+   * before either records — but the window is one job's duration, not the
+   * hours a misconfigured second scheduler runs for, and closing it properly
+   * needs a lock this database does not have.
+   */
+  minIntervalMinutes?: number;
+  /** Set by `?force=1`, so a job can still be triggered by hand for testing. */
+  force?: boolean;
+}
+
 export async function runJob<T extends Record<string, unknown>>(
   name: string,
-  handler: () => Promise<T>
+  handler: () => Promise<T>,
+  options: RunJobOptions = {}
 ): Promise<NextResponse> {
   const started = Date.now();
-  const { recordJobRun } = await import('@/lib/db/repositories');
+  const { recordJobRun, minutesSinceLastRun } = await import('@/lib/db/repositories');
+
+  const { minIntervalMinutes, force } = options;
+  if (minIntervalMinutes && minIntervalMinutes > 0 && !force) {
+    const since = await minutesSinceLastRun(name).catch(() => null);
+    if (since !== null && since < minIntervalMinutes) {
+      console.warn(
+        `[job:${name}] skipped — ran ${since.toFixed(1)}m ago, minimum interval is ${minIntervalMinutes}m. ` +
+          'Another scheduler may still be running against this database.'
+      );
+      return ok({
+        job: name,
+        status: 'skipped',
+        reason:
+          'ran ' + since.toFixed(1) + ' minutes ago; minimum interval is ' + minIntervalMinutes +
+          ' minutes. Pass ?force=1 to override.',
+        minutesSinceLastRun: Number(since.toFixed(1)),
+      });
+    }
+  }
 
   try {
     const result = await handler();

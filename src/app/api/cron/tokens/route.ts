@@ -22,6 +22,9 @@ export async function GET(request: Request) {
   const auth = authorizeJob(request);
   if (!auth.ok) return auth.response;
 
+  // `?force=1` bypasses the double-run guard, for manual testing.
+  const force = new URL(request.url).searchParams.get('force') === '1';
+
   const url = new URL(request.url);
   const discover = url.searchParams.get('discover') !== 'false';
 
@@ -42,7 +45,7 @@ export async function GET(request: Request) {
       evaluatedCandidates: discovery.evaluated,
       addedTokens: discovery.added,
     };
-  });
+  }, { minIntervalMinutes: 120, force });
 }
 
 export const POST = GET;
