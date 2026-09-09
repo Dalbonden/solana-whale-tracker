@@ -63,7 +63,30 @@ export const config = {
      * (`netlify/functions/`) drive the jobs instead.
      */
     get isServerless(): boolean {
-      return Boolean(optional('NETLIFY') || optional('VERCEL'));
+      /*
+       * Checked against several signals because the obvious one is not enough.
+       *
+       * `NETLIFY` is set in the *build* environment but not in the function
+       * runtime, so a check for it alone returns false exactly where it matters
+       * — verified on the deployed site, which reported `driver=in-process,
+       * enabled=true` while running on Netlify. The remaining variables are
+       * present at runtime: Netlify's Next runtime exposes DEPLOY_ID and
+       * SITE_ID, and its functions execute on Lambda, which always sets
+       * AWS_LAMBDA_FUNCTION_NAME and LAMBDA_TASK_ROOT.
+       *
+       * Erring towards "serverless" is the safe direction: the cost of a false
+       * positive is a scheduler that has to be enabled with SCHEDULER=on, while
+       * the cost of a false negative is an unbounded number of schedulers, one
+       * per cold start, all hammering the same rate-limited providers.
+       */
+      return Boolean(
+        optional('NETLIFY') ||
+          optional('VERCEL') ||
+          optional('DEPLOY_ID') ||
+          optional('SITE_ID') ||
+          optional('AWS_LAMBDA_FUNCTION_NAME') ||
+          optional('LAMBDA_TASK_ROOT')
+      );
     },
   },
 

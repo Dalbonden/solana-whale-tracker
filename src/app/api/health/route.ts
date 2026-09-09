@@ -4,6 +4,28 @@ import { dbHealthy } from '@/lib/db/client';
 import { schedulerStatus } from '@/lib/core/scheduler';
 import { getRecentJobRuns } from '@/lib/db/repositories';
 
+/**
+ * Reduces a provider endpoint to just its host.
+ *
+ * This is served publicly, and providers put credentials in wildly different
+ * places: Helius uses `?api-key=`, Alchemy puts the key in the path as
+ * `/v2/<key>`. A regex that redacted only the query string therefore published
+ * the Alchemy key in full the moment standard RPC was pointed at it.
+ *
+ * So rather than pattern-matching the secret, this keeps only what the reader
+ * actually needs — which provider is serving each role — and throws the rest
+ * away. Anything after the host is `/***` regardless of what it contains.
+ */
+function redactEndpoint(url: string): string {
+  try {
+    const parsed = new URL(url);
+    const hasDetail = (parsed.pathname && parsed.pathname !== '/') || parsed.search;
+    return `${parsed.protocol}//${parsed.host}${hasDetail ? '/***' : ''}`;
+  } catch {
+    return '(unset or malformed)';
+  }
+}
+
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
@@ -88,8 +110,8 @@ export async function GET() {
             : undefined,
         },
         rpc: {
-          standard: config.solana.rpcUrl.replace(/api-key=[^&]+/, 'api-key=***'),
-          das: config.solana.dasUrl.replace(/api-key=[^&]+/, 'api-key=***'),
+          standard: redactEndpoint(config.solana.rpcUrl),
+          das: redactEndpoint(config.solana.dasUrl),
           splitFromHelius: config.solana.rpcIsSeparateFromHelius,
           note: config.solana.rpcIsSeparateFromHelius
             ? undefined
