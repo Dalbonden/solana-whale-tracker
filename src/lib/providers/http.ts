@@ -9,11 +9,11 @@
 
 import {
   isExhausted,
-  markExhausted,
   markHealthy,
   providerFromLabel,
   QuotaExhaustedError,
   quotaSignal,
+  recordQuotaFailure,
 } from './budget';
 
 export class HttpError extends Error {
@@ -104,7 +104,9 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
         // time and, on metered plans, spends what little is left.
         const quota = quotaSignal(response.status, body);
         if (quota) {
-          markExhausted(provider, quota);
+          // One refusal from a flapping allowance is not proof the next call
+          // fails, so keep trying until the strike threshold is reached.
+          recordQuotaFailure(provider, quota);
           throw new QuotaExhaustedError(provider, quota);
         }
 
@@ -137,7 +139,7 @@ export async function request<T>(url: string, options: RequestOptions = {}): Pro
        */
       const quota = quotaSignal(response.status, text);
       if (quota) {
-        markExhausted(provider, quota);
+        recordQuotaFailure(provider, quota);
         throw new QuotaExhaustedError(provider, quota);
       }
 

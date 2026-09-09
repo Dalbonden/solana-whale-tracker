@@ -88,3 +88,39 @@ test('an untouched provider is never considered exhausted', () => {
   assert.equal(isExhausted('jupiter'), false);
   assert.equal(exhaustionReason('jupiter'), null);
 });
+
+// --- flapping vs spent -------------------------------------------------------
+//
+// Helius was observed serving two calls then refusing the third in the same
+// minute, while a different endpoint on the same key returned 200 throughout.
+// Treating the first refusal as proof stopped 30 minutes of ingest that would
+// mostly have succeeded.
+
+const { recordQuotaFailure } = require('../.test-build/providers/budget.js');
+
+test('one refusal does not block a provider', () => {
+  markHealthy('geckoterminal');
+  const blocked = recordQuotaFailure('geckoterminal', 'flap', 10_000);
+  assert.equal(blocked, false, 'a single refusal must not blind the app');
+  assert.equal(isExhausted('geckoterminal'), false);
+  markHealthy('geckoterminal');
+});
+
+test('two consecutive refusals do block it', () => {
+  markHealthy('solscan');
+  assert.equal(recordQuotaFailure('solscan', 'spent', 10_000), false);
+  assert.equal(recordQuotaFailure('solscan', 'spent', 10_000), true);
+  assert.equal(isExhausted('solscan'), true);
+  markHealthy('solscan');
+});
+
+test('a success between refusals resets the count', () => {
+  // Otherwise unrelated refusals hours apart would eventually add up to a block.
+  markHealthy('other');
+  recordQuotaFailure('other', 'one', 10_000);
+  markHealthy('other');
+  const blocked = recordQuotaFailure('other', 'two', 10_000);
+  assert.equal(blocked, false, 'the earlier strike should have been cleared');
+  assert.equal(isExhausted('other'), false);
+  markHealthy('other');
+});

@@ -99,6 +99,24 @@ interface Exhaustion {
   since: number;
 }
 
+/**
+ * Consecutive quota answers before a provider is considered exhausted.
+ *
+ * A depleted allowance does not always fail cleanly. Helius was observed
+ * serving some calls and refusing others in the same minute -- `getHealth`
+ * succeeding twice then answering `max usage reached` on the third attempt,
+ * while the enhanced-transactions endpoint returned 200 throughout. Treating
+ * the first refusal as proof stopped thirty minutes of ingest that would
+ * mostly have succeeded.
+ *
+ * Two strikes distinguishes a flapping allowance, where traffic should keep
+ * flowing, from a spent one, where every call fails and the strikes accumulate
+ * immediately. Any successful response clears the count.
+ */
+const STRIKES_BEFORE_EXHAUSTED = 2;
+
+const strikes = new Map<Provider, number>();
+
 /*
  * Held on globalThis for the same reason the scheduler is: Next does not
  * guarantee that route handlers and the instrumentation hook share a module
@@ -111,6 +129,32 @@ function store(): Map<Provider, Exhaustion> {
   const globals = globalThis as Record<symbol, unknown>;
   if (!globals[GLOBAL_KEY]) globals[GLOBAL_KEY] = new Map<Provider, Exhaustion>();
   return globals[GLOBAL_KEY] as Map<Provider, Exhaustion>;
+}
+
+/**
+ * Records a quota answer. Returns true once the provider is actually blocked.
+ *
+ * Callers should keep attempting until this returns true: a single refusal from
+ * a flapping allowance is not evidence that the next call will fail.
+ */
+export function recordQuotaFailure(
+  provider: Provider,
+  reason: string,
+  cooldownMs = COOLDOWN_MS
+): boolean {
+  const count = (strikes.get(provider) ?? 0) + 1;
+  strikes.set(provider, count);
+
+  if (count < STRIKES_BEFORE_EXHAUSTED) {
+    console.warn(
+      `[budget] ${provider} refused a call (${reason}) — strike ${count} of ${STRIKES_BEFORE_EXHAUSTED}. ` +
+        'Still attempting; an allowance can refuse one call and serve the next.'
+    );
+    return false;
+  }
+
+  markExhausted(provider, reason, cooldownMs);
+  return true;
 }
 
 export function markExhausted(provider: Provider, reason: string, cooldownMs = COOLDOWN_MS): void {
@@ -144,6 +188,10 @@ export function exhaustionReason(provider: Provider): string | null {
 
 /** Clears the record after a provider answers successfully again. */
 export function markHealthy(provider: Provider): void {
+  // A success is evidence the allowance is serving again, so the strike count
+  // must not carry across it — otherwise unrelated refusals hours apart would
+  // eventually add up to a block.
+  strikes.delete(provider);
   if (store().has(provider)) {
     console.info(`[budget] ${provider} is answering again.`);
     store().delete(provider);
