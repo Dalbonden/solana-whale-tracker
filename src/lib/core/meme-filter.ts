@@ -111,6 +111,31 @@ const WASH_TRADE_MIN_VOLUME_USD = 50_000;
 /** A comfortably organic token earns a small bonus. */
 const HEALTHY_ORGANIC_SHARE = 0.05;
 
+/*
+ * Deployer launch count above which a token is treated as factory output.
+ *
+ * Measured across the live universe. Every curated token's deployer has minted
+ * at most 222 tokens, and eight of the nine have minted 15 or fewer:
+ *
+ *   AI16Z 1 · SAMO 1 · BOME 1 · MEW 2 · POPCAT 5 · RETARDIO 6 · BONK 10 ·
+ *   WIF 15 · FWOG 222
+ *
+ * The auto-discovered set is different in kind: median 2, but p75 of 881 and a
+ * maximum of 19,614. Eleven of forty-five came from deployers with more than a
+ * thousand mints, and one wallet with 8,027 mints produced seven of them —
+ * BUTTHOLE, PURR, FRIES, STONK, ZCAT, USEFUL and BTC. A wallet that mints both
+ * "BTC" and "BUTTHOLE" is a token factory, not somebody launching a project.
+ *
+ * 1,000 sits in the gap with 4.5x headroom over the highest curated value, so
+ * it separates the two populations without touching anything known-good. It
+ * also excludes institutional issuance — the xStocks tokenized equities share
+ * an issuer wallet at 1,331 — which belongs out of a meme universe anyway.
+ *
+ * Checked on-chain: these are ordinary wallets, `executable=false` and owned by
+ * the System Program, not launchpad programs. The count is real.
+ */
+const MAX_DEPLOYER_MINTS = 1_000;
+
 interface TokenSnapshot {
   symbol: string | null;
   name: string | null;
@@ -119,6 +144,8 @@ interface TokenSnapshot {
   marketCap: number | null;
   /** Jupiter only; null means unknown, never zero. */
   organicVolume24h: number | null;
+  /** How many mints this token's deployer has created. Jupiter only. */
+  deployerMints: number | null;
 }
 
 /**
@@ -138,6 +165,7 @@ async function tokenSnapshot(mint: string): Promise<TokenSnapshot | null> {
       volume24h: meta.volume24hUsd,
       marketCap: meta.mcap,
       organicVolume24h: meta.organicVolume24hUsd,
+      deployerMints: meta.devMints,
     };
   }
 
@@ -150,6 +178,7 @@ async function tokenSnapshot(mint: string): Promise<TokenSnapshot | null> {
     volume24h: overview.v24hUSD ?? null,
     marketCap: birdeye.marketCapOf(overview),
     organicVolume24h: null,
+    deployerMints: null,
   };
 }
 
@@ -249,6 +278,23 @@ export async function classifyToken(mint: string): Promise<ClassificationResult>
    * scored highly for its churn. Only applied when the figure is available --
    * Birdeye has no equivalent, and absence is not evidence.
    */
+  /*
+   * Factory output is not a meme token.
+   *
+   * Volume, liquidity and market cap all look ordinary on a token minted by a
+   * wallet that has minted thousands of others — the numbers describe the
+   * market, not the provenance. This is the only check that asks who made it.
+   *
+   * Only applied when the count is known; Birdeye has no equivalent field, and
+   * absence is not evidence.
+   */
+  if (snapshot.deployerMints !== null && snapshot.deployerMints > MAX_DEPLOYER_MINTS) {
+    reasons.push(
+      `deployer has minted ${snapshot.deployerMints.toLocaleString()} tokens — factory output, not a project`
+    );
+    return { isMeme: false, confidence, reasons, source };
+  }
+
   if (snapshot.organicVolume24h !== null && volume > 0) {
     const organicShare = snapshot.organicVolume24h / volume;
 
