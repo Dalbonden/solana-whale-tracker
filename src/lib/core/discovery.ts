@@ -211,6 +211,14 @@ export async function runDiscovery(
 }
 
 /**
+ * Realised profit that exempts a wallet from the portfolio floor.
+ *
+ * An order of magnitude below the two wallets it protects ($140,654 and
+ * $190,870), so it is a floor rather than a number fitted to them.
+ */
+const PROVEN_EARNER_USD = 25_000;
+
+/**
  * Re-evaluates wallets already tracked and untracks the ones that no longer
  * qualify. Without this the whale list only ever grows.
  */
@@ -227,7 +235,20 @@ export async function pruneInactiveWhales(
     const dormant = lastActive > 0 && lastActive < cutoff;
     const belowFloor = whale.portfolio_value_usd < config.detection.minPortfolioUsd * 0.5;
 
-    if (dormant || belowFloor) {
+    /*
+     * Realised profit overrides the balance floor.
+     *
+     * Pruning on current balance penalises exactly the wallets worth keeping.
+     * `47d8u9aK` holds $0 against $190,870 realised -- it holds nothing BECAUSE
+     * it cashed out, which is what winning looks like, and the floor untracked
+     * it for that. `6b5JivZq` is the same shape: $24k held, $140,654 realised.
+     *
+     * Dormancy still prunes. A wallet that made money once and has not traded
+     * in six weeks is history, not a signal.
+     */
+    const provenEarner = (whale.realized_pnl_usd ?? 0) >= PROVEN_EARNER_USD;
+
+    if (dormant || (belowFloor && !provenEarner)) {
       updates.push({ address: whale.address, is_tracked: false });
       untracked.push(whale.address);
     }

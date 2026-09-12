@@ -207,13 +207,20 @@ export interface WhaleScore {
   reasons: string[];
   components: {
     portfolio: number;
+    /** Typical trade size. The single strongest signal that a wallet is a person. */
+    avgTradeSize: number;
     tradeSize: number;
-    frequency: number;
     memeExposure: number;
-    diversity: number;
+    /** Focus, not breadth: touching few mints scores HIGH. */
+    concentration: number;
     /** Money actually banked. Zero when the wallet has no observed record. */
     profitability: number;
   };
+  /**
+   * Multiplier applied for market-making behaviour, 0..1. 1 means no penalty.
+   * Surfaced so a heavily discounted score explains itself.
+   */
+  churnMultiplier: number;
 }
 
 export interface ApiListResponse<T> {

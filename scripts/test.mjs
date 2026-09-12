@@ -35,6 +35,7 @@ const compile = spawnSync(
     'src/lib/providers/batch.ts',
     'src/lib/providers/budget.ts',
     'src/lib/core/sync-cadence.ts',
+    'src/lib/core/whale-score.ts',
     '--rootDir',
     'src/lib',
     '--outDir',

@@ -1,16 +1,16 @@
 /**
  * Whale detection: who counts as a whale, and how strongly.
  *
- * Scoring is deliberately multi-factor. Portfolio value alone would flag
- * dormant bags and CEX hot wallets; trade size alone would flag arbitrage bots
- * that never hold anything. A tracker worth reading wants wallets that hold
- * size *and* actively rotate meme exposure, so the score blends five signals:
+ * Scoring is multi-factor, and weighted towards evidence that a HUMAN is
+ * trading rather than a market maker quoting:
  *
- *   portfolio value   35%   can they move a market
- *   max trade size    25%   do they actually deploy size
- *   trade frequency   20%   are they active right now
- *   meme exposure     15%   is this a meme trader or a DeFi fund
- *   token diversity    5%   rotating across names, not one-token maxi
+ *   average trade size  32%   the cleanest separator in the labelled data
+ *   realised profit     30%   money actually banked, not paper gains
+ *   concentration       16%   focus on few mints, not breadth across many
+ *   portfolio value     12%   can they move a market
+ *   meme exposure       10%   a meme trader or a DeFi fund
+ *
+ * ...then multiplied by a churn penalty for high-count, tiny-size activity.
  *
  * A wallet must clear the portfolio floor and at least one activity signal
  * before the score is even computed — see `evaluateWallet`.
@@ -26,44 +26,7 @@ import { NATIVE_SOL, NON_MEME_MINTS } from '@/lib/solana/constants';
 import type { WalletMetrics, Whale, WhaleScore, WhaleTier } from '@/types';
 
 import { getTrackedMints } from './meme-filter';
-
-/** Maps a value onto 0..1 across a log-scaled range. */
-function logNorm(value: number, min: number, max: number): number {
-  if (value <= min) return 0;
-  if (value >= max) return 1;
-  const lo = Math.log10(Math.max(min, 1));
-  const hi = Math.log10(max);
-  return (Math.log10(value) - lo) / (hi - lo);
-}
-
-function linNorm(value: number, min: number, max: number): number {
-  if (value <= min) return 0;
-  if (value >= max) return 1;
-  return (value - min) / (max - min);
-}
-
-/*
- * Weights.
- *
- * `profitability` was added after the roster filled with wallets that trade
- * enormously and lose steadily: six of the first ten classified as
- * "distributing", 78 losing sells against 27 winners, net realised P&L of
- * -$201. Nothing in the original score rewarded making money, so the pipeline
- * optimised for size and churn — and churn correlates with losses.
- *
- * Portfolio and trade size gave up ten points between them to fund it. Being
- * rich is a weaker signal than getting richer: a large balance can be inherited
- * from one lucky position or from a wallet that has been bleeding for months,
- * whereas banked profit is evidence of a repeatable process.
- */
-const WEIGHTS = {
-  portfolio: 0.28,
-  tradeSize: 0.2,
-  frequency: 0.17,
-  memeExposure: 0.13,
-  diversity: 0.05,
-  profitability: 0.17,
-} as const;
+import { computeScore, linNorm, logNorm } from './whale-score';
 
 export function tierForScore(score: number): WhaleTier {
   if (score >= 85) return 'kraken';
@@ -73,66 +36,10 @@ export function tierForScore(score: number): WhaleTier {
 }
 
 export function scoreWallet(metrics: WalletMetrics): WhaleScore {
-  /*
-   * Largest observed trade, falling back to the mean for wallets we have not
-   * synced yet (max is 0 until a trade is actually parsed). Without the
-   * fallback every freshly discovered wallet would score 0 on trade size and
-   * fail the gate, so discovery could never bootstrap.
-   */
+  const { score, churnMultiplier, components } = computeScore(metrics);
   const effectiveTradeSize = Math.max(metrics.maxTradeSizeUsd, metrics.avgTradeSizeUsd);
 
-  /*
-   * Meme engagement = holdings exposure OR trading flow.
-   *
-   * Measuring exposure purely from a point-in-time snapshot systematically
-   * penalises the most active meme traders: a wallet that flips memes all day
-   * and parks in SOL overnight shows ~1% exposure, while a dormant bag-holder
-   * shows 90%. Observed rejections were dominated by this — candidates pulled
-   * from a meme-token top-trader list, rejected for "meme exposure 1.4% < 5%".
-   *
-   * Trading the tracked meme universe is exposure to meme markets, just held as
-   * flow rather than inventory, so it counts. Holdings still dominate when they
-   * exist; flow only sets a floor, and is capped below 1 so a pure flipper
-   * never outscores someone doing both.
-   */
-  const flowEngagement = linNorm(metrics.tradeCount30d, 5, 120) * 0.7;
-  const memeEngagement = Math.min(Math.max(metrics.memeExposurePct, flowEngagement), 1);
-
-  /*
-   * Profitability from money actually banked.
-   *
-   * Realised only — paper gains are not evidence. A wallet is credited from
-   * $1k of realised profit and saturates at $1M; losses score zero rather than
-   * negative, because an unprofitable wallet may still be worth tracking (a
-   * large distributor moves markets regardless of whether it is any good at
-   * it), it just should not outrank a profitable one.
-   */
-  const profitability =
-    metrics.realizedPnlUsd > 0 ? logNorm(metrics.realizedPnlUsd, 1_000, 1_000_000) : 0;
-
-  const components = {
-    // $50k → 0, $50M → 1
-    portfolio: logNorm(metrics.portfolioValueUsd, 50_000, 50_000_000),
-    // $5k → 0, $5M → 1
-    tradeSize: logNorm(effectiveTradeSize, 5_000, 5_000_000),
-    // 2 trades/30d → 0, 150 → 1
-    frequency: linNorm(metrics.tradeCount30d, 2, 150),
-    memeExposure: memeEngagement,
-    // 1 token → 0, 12 → 1
-    diversity: linNorm(metrics.distinctTokens30d, 1, 12),
-    profitability,
-  };
-
-  const score =
-    100 *
-    (components.portfolio * WEIGHTS.portfolio +
-      components.tradeSize * WEIGHTS.tradeSize +
-      components.frequency * WEIGHTS.frequency +
-      components.memeExposure * WEIGHTS.memeExposure +
-      components.diversity * WEIGHTS.diversity +
-      components.profitability * WEIGHTS.profitability);
-
-  const rounded = Number(score.toFixed(2));
+  const rounded = score;
   const reasons: string[] = [];
 
   const { detection } = config;
@@ -170,7 +77,7 @@ export function scoreWallet(metrics: WalletMetrics): WhaleScore {
 
   if (qualifies) reasons.push('qualifies');
 
-  return { score: rounded, tier: tierForScore(rounded), qualifies, reasons, components };
+  return { score: rounded, tier: tierForScore(rounded), qualifies, reasons, components, churnMultiplier };
 }
 
 // ---------------------------------------------------------------------------
@@ -374,12 +281,13 @@ export async function evaluateWallet(
         reasons: ['excluded: exchange / market maker / protocol account'],
         components: {
           portfolio: 0,
+          avgTradeSize: 0,
           tradeSize: 0,
-          frequency: 0,
           memeExposure: 0,
-          diversity: 0,
+          concentration: 0,
           profitability: 0,
         },
+        churnMultiplier: 1,
       },
       whale: null,
       rejected: 'institutional account',
